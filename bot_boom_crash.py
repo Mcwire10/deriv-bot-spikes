@@ -24,17 +24,17 @@ STOP_LOSS_TRADE = 0.70       # Cierra automático si pierde $0.70 (actúa como t
 
 # Zona horaria de Argentina
 TZ_ARGENTINA = timezone(timedelta(hours=-3))
-moneda_cuenta = "USD"        # Se actualizará al conectar
+moneda_cuenta = "USD"        
 
 # ══════════════════════════════════════════
-#  CONFIGURACIÓN DE MERCADOS (Símbolos Originales)
+#  CONFIGURACIÓN DE MERCADOS
 # ══════════════════════════════════════════
 SIMBOLOS = {
     "BOOM1000": {
         "nombre": "Boom 1000",
-        "tipo": "BOOM",           # Usa MULTUP
+        "tipo": "BOOM",           
         "umbral_spike": 1.5,      
-        "ticks_agotamiento": 700, # Ticks cayendo sin explotar para entrar
+        "ticks_agotamiento": 700, 
         "cooldown": 180
     },
     "BOOM500": {
@@ -46,7 +46,7 @@ SIMBOLOS = {
     },
     "CRASH1000": {
         "nombre": "Crash 1000",
-        "tipo": "CRASH",          # Usa MULTDOWN
+        "tipo": "CRASH",          
         "umbral_spike": -1.5,
         "ticks_agotamiento": 700,
         "cooldown": 180
@@ -95,12 +95,11 @@ def reset_diario():
         fecha_actual = hoy
 
 # ══════════════════════════════════════════
-#  EJECUCIÓN DE ÓRDENES (Ahora con Multiplicadores)
+#  EJECUCIÓN DE ÓRDENES
 # ══════════════════════════════════════════
 async def enviar_orden(ws, symbol, contract_type, cfg, ticks_acumulados):
     est = estado_simbolos[symbol]
     
-    # Adaptación a Multiplicadores
     ctype_mult = "MULTUP" if contract_type == "CALL" else "MULTDOWN"
     emoji = "🟢" if ctype_mult == "MULTUP" else "🔴"
     
@@ -159,7 +158,7 @@ async def deriv_bot():
                         
                         print(f"🚀 CAZADOR DE SPIKES CONECTADO | Saldo: ${balance_actual} {moneda_cuenta}")
                         enviar_telegram(
-                            f"⚡ Bot Boom/Crash (Multiplicadores) Iniciado!\n"
+                            f"⚡ Bot Boom/Crash (Filtrado v2) Iniciado!\n"
                             f"💰 Saldo inicial: ${balance_actual} {moneda_cuenta}\n"
                             f"⚙️ Multiplicador: x{MULTIPLIER} (TP: ${TAKE_PROFIT_TRADE} | SL: ${STOP_LOSS_TRADE})\n"
                             f"🎯 Meta Diaria: +${META_DIARIA_USD}\n"
@@ -189,7 +188,6 @@ async def deriv_bot():
                             prev_price = est["prices"][-2]
                             delta = price - prev_price
                             
-                            # Detección de Spikes
                             es_spike = False
                             if cfg["tipo"] == "BOOM" and delta > cfg["umbral_spike"]:
                                 es_spike = True
@@ -218,6 +216,11 @@ async def deriv_bot():
                         contract = msg["proposal_open_contract"]
                         if contract.get("is_sold"):
                             symbol = contract.get("underlying")
+                            
+                            # FILTRO DE SEGURIDAD VITAL: Ignorar índices de volatilidad
+                            if symbol not in SIMBOLOS:
+                                continue
+                                
                             profit = float(contract.get("profit", 0))
                             balance_actual = float(contract.get("balance_after", balance_actual))
                             profit_del_dia += profit
