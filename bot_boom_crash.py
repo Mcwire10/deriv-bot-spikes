@@ -13,48 +13,50 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ══════════════════════════════════════════
 #  CONFIGURACIÓN DE RIESGO Y METAS
 # ══════════════════════════════════════════
-META_DIARIA_USD = 15.0       # Apaga el bot al ganar esto
-STOP_LOSS_DIARIO_USD = -15.0 # Apaga el bot al perder esto
-STAKE_BASE = 1.0             # Riesgo bajo por operación
+META_DIARIA_USD = 15.0       
+STOP_LOSS_DIARIO_USD = -15.0 
+
+# Configuración del Multiplicador
+STAKE_BASE = 1.0             
+MULTIPLIER = 300             # Apalancamiento para maximizar el spike
+TAKE_PROFIT_TRADE = 3.00     # Cierra automático si el spike da $3 de ganancia
+STOP_LOSS_TRADE = 0.70       # Cierra automático si pierde $0.70 (actúa como tiempo límite)
 
 # Zona horaria de Argentina
 TZ_ARGENTINA = timezone(timedelta(hours=-3))
+moneda_cuenta = "USD"        # Se actualizará al conectar
 
 # ══════════════════════════════════════════
-#  CONFIGURACIÓN DE MERCADOS (Símbolos EZ)
+#  CONFIGURACIÓN DE MERCADOS (Símbolos Originales)
 # ══════════════════════════════════════════
 SIMBOLOS = {
-    "BOOM1000EZ": {
+    "BOOM1000": {
         "nombre": "Boom 1000",
-        "tipo": "BOOM",
-        "umbral_spike": 1.5,      # Salto en puntos para detectar un spike real
-        "ticks_agotamiento": 700, # Ticks que deben pasar sin spike para entrar (Aprox 11 mins)
-        "duracion_ticks": 5,
-        "cooldown": 120
+        "tipo": "BOOM",           # Usa MULTUP
+        "umbral_spike": 1.5,      
+        "ticks_agotamiento": 700, # Ticks cayendo sin explotar para entrar
+        "cooldown": 180
     },
-    "BOOM500EZ": {
+    "BOOM500": {
         "nombre": "Boom 500",
         "tipo": "BOOM",
         "umbral_spike": 1.0,
-        "ticks_agotamiento": 350, # Boom 500 explota más seguido
-        "duracion_ticks": 5,
-        "cooldown": 120
+        "ticks_agotamiento": 350, 
+        "cooldown": 180
     },
-    "CRASH1000EZ": {
+    "CRASH1000": {
         "nombre": "Crash 1000",
-        "tipo": "CRASH",
+        "tipo": "CRASH",          # Usa MULTDOWN
         "umbral_spike": -1.5,
         "ticks_agotamiento": 700,
-        "duracion_ticks": 5,
-        "cooldown": 120
+        "cooldown": 180
     },
-    "CRASH500EZ": {
+    "CRASH500": {
         "nombre": "Crash 500",
         "tipo": "CRASH",
         "umbral_spike": -1.0,
         "ticks_agotamiento": 350,
-        "duracion_ticks": 5,
-        "cooldown": 120
+        "cooldown": 180
     }
 }
 
@@ -75,9 +77,6 @@ estado_simbolos = {s: {
     "ultimo_ctx": {}
 } for s in SIMBOLOS}
 
-# ══════════════════════════════════════════
-#  UTILIDADES
-# ══════════════════════════════════════════
 def enviar_telegram(mensaje):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -89,42 +88,53 @@ def reset_diario():
     global profit_del_dia, trades_ganados, trades_perdidos, bot_pausado_por_hoy, fecha_actual
     hoy = datetime.now(TZ_ARGENTINA).date()
     if hoy != fecha_actual:
-        enviar_telegram(f"🌅 Nuevo día detectado. Reseteando métricas.\nProfit anterior: ${round(profit_del_dia,2)}")
+        enviar_telegram(f"🌅 Nuevo día. Reseteando métricas.\nProfit anterior: ${round(profit_del_dia,2)}")
         profit_del_dia = 0.0
-        trades_ganados = 0
-        trades_perdidos = 0
+        trades_ganados = trades_perdidos = 0
         bot_pausado_por_hoy = False
         fecha_actual = hoy
 
 # ══════════════════════════════════════════
-#  EJECUCIÓN DE ÓRDENES
+#  EJECUCIÓN DE ÓRDENES (Ahora con Multiplicadores)
 # ══════════════════════════════════════════
 async def enviar_orden(ws, symbol, contract_type, cfg, ticks_acumulados):
     est = estado_simbolos[symbol]
+    
+    # Adaptación a Multiplicadores
+    ctype_mult = "MULTUP" if contract_type == "CALL" else "MULTDOWN"
+    emoji = "🟢" if ctype_mult == "MULTUP" else "🔴"
+    
     est["ultimo_ctx"] = {
-        "tipo": contract_type,
+        "tipo": ctype_mult,
         "ticks_acum": ticks_acumulados,
         "hora": datetime.now(TZ_ARGENTINA).strftime("%H:%M:%S")
     }
     
     await ws.send(json.dumps({
-        "buy": 1, "price": STAKE_BASE,
+        "buy": 1, 
+        "price": STAKE_BASE,
         "parameters": {
-            "amount": STAKE_BASE, "basis": "stake",
-            "contract_type": contract_type, "currency": "eUSDT",
-            "duration": cfg["duracion_ticks"], "duration_unit": "t", "symbol": symbol
+            "amount": STAKE_BASE, 
+            "basis": "stake",
+            "contract_type": ctype_mult, 
+            "currency": moneda_cuenta,
+            "multiplier": MULTIPLIER,
+            "symbol": symbol,
+            "limit_order": {
+                "take_profit": TAKE_PROFIT_TRADE,
+                "stop_loss": STOP_LOSS_TRADE
+            }
         }
     }))
     
-    emoji = "🟢" if contract_type == "CALL" else "🔴"
-    print(f"{emoji} DISPARO [{cfg['nombre']}] | {contract_type} | Agotamiento: {ticks_acumulados} ticks | ${STAKE_BASE}")
+    print(f"{emoji} DISPARO [{cfg['nombre']}] | {ctype_mult} x{MULTIPLIER} | Agotamiento: {ticks_acumulados} ticks | Stake: ${STAKE_BASE}")
     return time.time()
 
 # ══════════════════════════════════════════
 #  LÓGICA PRINCIPAL DEL BOT
 # ══════════════════════════════════════════
 async def deriv_bot():
-    global balance_actual, profit_del_dia, trades_ganados, trades_perdidos, bot_pausado_por_hoy
+    global balance_actual, profit_del_dia, trades_ganados, trades_perdidos, bot_pausado_por_hoy, moneda_cuenta
 
     url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
@@ -145,15 +155,16 @@ async def deriv_bot():
                     # 1. Autorización Exitosa
                     if "authorize" in msg:
                         balance_actual = float(msg["authorize"]["balance"])
-                        print(f"🚀 CAZADOR DE SPIKES CONECTADO | Saldo: ${balance_actual}")
+                        moneda_cuenta = msg["authorize"].get("currency", "USD")
+                        
+                        print(f"🚀 CAZADOR DE SPIKES CONECTADO | Saldo: ${balance_actual} {moneda_cuenta}")
                         enviar_telegram(
-                            f"⚡ Bot Boom/Crash (Agotamiento) Iniciado!\n"
-                            f"💰 Saldo inicial: ${balance_actual}\n"
+                            f"⚡ Bot Boom/Crash (Multiplicadores) Iniciado!\n"
+                            f"💰 Saldo inicial: ${balance_actual} {moneda_cuenta}\n"
+                            f"⚙️ Multiplicador: x{MULTIPLIER} (TP: ${TAKE_PROFIT_TRADE} | SL: ${STOP_LOSS_TRADE})\n"
                             f"🎯 Meta Diaria: +${META_DIARIA_USD}\n"
-                            f"🛑 Stop Loss: ${STOP_LOSS_DIARIO_USD}\n"
-                            f"🎲 Stake Base: ${STAKE_BASE}"
+                            f"🛑 Stop Loss: ${STOP_LOSS_DIARIO_USD}"
                         )
-                        # Suscribirse a los 4 mercados con los símbolos EZ
                         for sym in SIMBOLOS:
                             await ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
                         await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
@@ -161,7 +172,6 @@ async def deriv_bot():
                     # 2. Recepción de Ticks
                     if "tick" in msg and not bot_pausado_por_hoy:
                         reset_diario()
-                        
                         symbol = msg["tick"]["symbol"]
                         price = msg["tick"]["quote"]
 
@@ -179,7 +189,7 @@ async def deriv_bot():
                             prev_price = est["prices"][-2]
                             delta = price - prev_price
                             
-                            # Detección de Spikes para reiniciar el contador
+                            # Detección de Spikes
                             es_spike = False
                             if cfg["tipo"] == "BOOM" and delta > cfg["umbral_spike"]:
                                 es_spike = True
@@ -193,17 +203,13 @@ async def deriv_bot():
                             else:
                                 est["ticks_desde_spike"] += 1
 
-                            # Log de estado para saber que está vivo (cada 100 ticks)
                             if est["ticks_desde_spike"] > 0 and est["ticks_desde_spike"] % 100 == 0:
                                 print(f"👀 [{cfg['nombre']}] Ticks sin explotar: {est['ticks_desde_spike']}/{cfg['ticks_agotamiento']}")
 
                             # Lógica de Disparo
                             if time.time() - est["ultimo_trade"] > cfg["cooldown"]:
-                                # BOOM: Entra CALL si lleva mucho tiempo cayendo
                                 if cfg["tipo"] == "BOOM" and est["ticks_desde_spike"] >= cfg["ticks_agotamiento"]:
                                     est["ultimo_trade"] = await enviar_orden(ws, symbol, "CALL", cfg, est["ticks_desde_spike"])
-
-                                # CRASH: Entra PUT si lleva mucho tiempo subiendo
                                 elif cfg["tipo"] == "CRASH" and est["ticks_desde_spike"] >= cfg["ticks_agotamiento"]:
                                     est["ultimo_trade"] = await enviar_orden(ws, symbol, "PUT", cfg, est["ticks_desde_spike"])
 
@@ -224,14 +230,14 @@ async def deriv_bot():
                                 msg_res = f"🔥 SPIKE ATRAPADO! +${round(profit,2)}"
                             else:
                                 trades_perdidos += 1
-                                msg_res = f"❌ Falso pico -${abs(round(profit,2))}"
+                                msg_res = f"❌ Falso pico (Stop Loss) -${abs(round(profit,2))}"
 
                             total_trades = trades_ganados + trades_perdidos
                             wr = round((trades_ganados / total_trades) * 100, 1) if total_trades > 0 else 0
 
                             resumen = (
                                 f"{msg_res}\n"
-                                f"📊 Mercado: {nombre_sym} ({ctx.get('tipo')})\n"
+                                f"📊 Mercado: {nombre_sym} ({ctx.get('tipo')} x{MULTIPLIER})\n"
                                 f"⏱ Hora: {ctx.get('hora')} ARG | Agotamiento: {ctx.get('ticks_acum')} ticks\n"
                                 f"💵 Saldo: ${balance_actual}\n"
                                 f"📈 Profit Diario: ${round(profit_del_dia, 2)} / ${META_DIARIA_USD}\n"
@@ -240,12 +246,12 @@ async def deriv_bot():
                             print(resumen.replace('\n', ' | '))
                             enviar_telegram(resumen)
 
-                            # 4. Verificación de Metas Diarias
+                            # 4. Verificación de Metas
                             if profit_del_dia >= META_DIARIA_USD:
-                                enviar_telegram(f"🏆 ¡META DIARIA ALCANZADA! (+${round(profit_del_dia,2)})\nEl bot se apaga hasta mañana para proteger tus ganancias.")
+                                enviar_telegram(f"🏆 ¡META DIARIA ALCANZADA! (+${round(profit_del_dia,2)})\nEl bot se apaga hasta mañana.")
                                 bot_pausado_por_hoy = True
                             elif profit_del_dia <= STOP_LOSS_DIARIO_USD:
-                                enviar_telegram(f"🛡️ STOP LOSS DIARIO ALCANZADO (${round(profit_del_dia,2)})\nEl bot se apaga hasta mañana para proteger tu capital.")
+                                enviar_telegram(f"🛡️ STOP LOSS DIARIO ALCANZADO (${round(profit_del_dia,2)})\nEl bot se apaga hasta mañana.")
                                 bot_pausado_por_hoy = True
 
         except Exception as e:
