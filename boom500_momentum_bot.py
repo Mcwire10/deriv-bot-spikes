@@ -1,13 +1,3 @@
-"""
-BOT BOOM500 - MOMENTUM 5 TICKS
-================================
-Señal validada con backtesting real:
-- Suma de últimos 5 deltas de precio
-- TP=0.20 / SL=0.04 con slippage incluido
-- Solo BOOM500
-- 93% winrate histórico | Expectancy +$8.66/trade
-"""
-
 import asyncio
 import json
 import websockets
@@ -25,17 +15,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 #  PARÁMETROS VALIDADOS POR BACKTESTING
 # ══════════════════════════════════════════
 SYMBOL        = "BOOM500"
-STAKE         = 1.00    # era 0.50
+STAKE         = 1.00
 MULTIPLIER    = 100
-TAKE_PROFIT   = 0.20    # se mantiene → +$10.00
-STOP_LOSS     = 0.04    # se mantiene → -$2.00
+TAKE_PROFIT   = 0.20   # 0.20 pts → +$10.00
+STOP_LOSS     = 0.10   # 0.10 pts → -$5.00
 MOMENTUM_N    = 5      # Últimos N deltas para la señal
 
 # ══════════════════════════════════════════
 #  RIESGO DIARIO
 # ══════════════════════════════════════════
-META_DIARIA      = 10.00   # ~2.5 trades ganadores
-STOP_LOSS_DIARIO = -4.00   # 2 trades perdedores × $2.00
+META_DIARIA      = 10.00   # 1 trade ganador
+STOP_LOSS_DIARIO = -10.00  # 2 trades perdedores máximo
 
 TZ_ARG = timezone(timedelta(hours=-3))
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -43,16 +33,16 @@ WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 # ══════════════════════════════════════════
 #  ESTADO GLOBAL
 # ══════════════════════════════════════════
-balance_actual       = None
-moneda              = "USD"
-profit_dia          = 0.0
-trades_ganados      = 0
-trades_perdidos     = 0
-bot_pausado         = False
-fecha_actual        = datetime.now(TZ_ARG).date()
-contratos_vistos    = set()
-trade_abierto       = False
-ultimo_ctx          = {}
+balance_actual    = None
+moneda            = "USD"
+profit_dia        = 0.0
+trades_ganados    = 0
+trades_perdidos   = 0
+bot_pausado       = False
+fecha_actual      = datetime.now(TZ_ARG).date()
+contratos_vistos  = set()
+trade_abierto     = False
+ultimo_ctx        = {}
 
 # Buffer de precios para calcular momentum
 precios = deque(maxlen=10)
@@ -97,7 +87,6 @@ def calcular_momentum() -> str | None:
         return None
 
     lista = list(precios)
-    # Usamos los últimos MOMENTUM_N deltas (entre i-6 e i-1)
     deltas = [lista[-(i)] - lista[-(i+1)] for i in range(1, MOMENTUM_N + 1)]
     suma = sum(deltas)
 
@@ -175,7 +164,7 @@ async def deriv_bot():
                             f"💰 Saldo: ${balance_actual} {moneda}\n"
                             f"📊 Señal: Momentum {MOMENTUM_N} ticks\n"
                             f"⚙️ Stake ${STAKE} | x{MULTIPLIER} | TP {TAKE_PROFIT}pts | SL {STOP_LOSS}pts\n"
-                            f"💵 TP=$10.00 | SL=$2.00\n"
+                            f"💵 TP=$10.00 | SL=$5.00\n"
                             f"🛡️ SL diario: ${abs(STOP_LOSS_DIARIO)} | Meta: ${META_DIARIA}"
                         )
                         await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
@@ -189,7 +178,7 @@ async def deriv_bot():
                         precios.append(price)
 
                         if trade_abierto:
-                            continue  # Esperamos que cierre el trade actual
+                            continue
 
                         direction = calcular_momentum()
                         if direction:
