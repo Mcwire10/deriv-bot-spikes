@@ -25,17 +25,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 #  PARÁMETROS VALIDADOS POR BACKTESTING
 # ══════════════════════════════════════════
 SYMBOL        = "BOOM500"
-STAKE         = 0.50
+STAKE         = 1.00    # era 0.50
 MULTIPLIER    = 100
-TAKE_PROFIT   = 0.20   # 0.20 pts → +$10.00
-STOP_LOSS     = 0.04   # 0.04 pts → -$2.00
+TAKE_PROFIT   = 0.20    # se mantiene → +$10.00
+STOP_LOSS     = 0.04    # se mantiene → -$2.00
 MOMENTUM_N    = 5      # Últimos N deltas para la señal
 
 # ══════════════════════════════════════════
 #  RIESGO DIARIO
 # ══════════════════════════════════════════
 META_DIARIA      = 10.00   # ~2.5 trades ganadores
-STOP_LOSS_DIARIO = -4.00   # Máximo 2 trades perdedores seguidos
+STOP_LOSS_DIARIO = -4.00   # 2 trades perdedores × $2.00
 
 TZ_ARG = timezone(timedelta(hours=-3))
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
