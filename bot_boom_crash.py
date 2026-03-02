@@ -16,15 +16,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 META_DIARIA_USD = 15.0       
 STOP_LOSS_DIARIO_USD = -15.0 
 
-# Configuración del Multiplicador
-STAKE_BASE = 1.0             
-MULTIPLIER = 300             # Apalancamiento para maximizar el spike
-TAKE_PROFIT_TRADE = 3.00     # Cierra automático si el spike da $3 de ganancia
-STOP_LOSS_TRADE = 0.70       # Cierra automático si pierde $0.70 (actúa como tiempo límite)
+# Configuración del Multiplicador ajustada a límites de Deriv
+STAKE_BASE = 0.50            # Reducido para cumplir con el límite de < $0.60
+MULTIPLIER = 300             # Mantenemos el apalancamiento alto para el spike
+TAKE_PROFIT_TRADE = 1.50     # TP sugerido (gana el triple del stake)
+STOP_LOSS_TRADE = 0.45       # SL debe ser menor al stake (corta perdiendo $0.45)
 
 # Zona horaria de Argentina
 TZ_ARGENTINA = timezone(timedelta(hours=-3))
-moneda_cuenta = "USD"        
+moneda_cuenta = "USD"
 
 # ══════════════════════════════════════════
 #  CONFIGURACIÓN DE MERCADOS
