@@ -1,11 +1,3 @@
-"""
-BOT BOOM500 - MOMENTUM 5 TICKS v6
-===================================
-- Señal: solo momentum 5 ticks
-- TP $0.50 / SL $0.50 simétrico
-- Todos los fixes de reconexión y candado
-"""
-
 import asyncio
 import json
 import websockets
