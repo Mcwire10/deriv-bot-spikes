@@ -1,12 +1,3 @@
-"""
-BOT BOOM500 - MOMENTUM 5 TICKS v4
-===================================
-FIXES:
-1. TP y SL en dólares reales ($10 / $5), no en puntos
-2. Candado de trade persiste después de reconexión (consulta contratos abiertos)
-3. Pausa automática si saldo < umbral mínimo para evitar liquidaciones por margen
-"""
-
 import asyncio
 import json
 import websockets
