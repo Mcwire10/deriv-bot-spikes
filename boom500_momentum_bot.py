@@ -17,13 +17,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SYMBOL        = "BOOM500"
 STAKE         = 1.00
 MULTIPLIER    = 100
-TAKE_PROFIT   = 10.00   # FIX 1: $10 de profit real (no 0.20 pts)
-STOP_LOSS     = 5.00    # FIX 1: $5 de loss real (no 0.10 pts)
+TAKE_PROFIT   = 2.00   # FIX 1: $10 de profit real (no 0.20 pts)
+STOP_LOSS     = 0.90    # FIX 1: $5 de loss real (no 0.10 pts)
 MOMENTUM_N    = 5
 
 META_DIARIA      = 10.00
 STOP_LOSS_DIARIO = -10.00
-SALDO_MINIMO     = 6.00  # FIX 3: pausa si saldo baja de $6 (evita liquidaciones)
+SALDO_MINIMO     = 4.00  # FIX 3: pausa si saldo baja de $6 (evita liquidaciones)
 
 TZ_ARG = timezone(timedelta(hours=-3))
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
