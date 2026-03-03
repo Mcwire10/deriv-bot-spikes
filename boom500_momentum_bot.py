@@ -1,12 +1,3 @@
-"""
-BOT BOOM500 - MOMENTUM + ESTRUCTURA DE MERCADO v5
-===================================================
-MEJORAS vs v4:
-1. TP $0.50 / SL $0.50 - simétrico, más alcanzable
-2. Filtro de estructura: higher highs/lows y lower highs/lows
-3. Todos los fixes anteriores
-"""
-
 import asyncio
 import json
 import websockets
