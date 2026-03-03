@@ -1,3 +1,11 @@
+"""
+BOT BOOM500 - MOMENTUM 5 TICKS v6
+===================================
+- Señal: solo momentum 5 ticks
+- TP $0.50 / SL $0.50 simétrico
+- Todos los fixes de reconexión y candado
+"""
+
 import asyncio
 import json
 import websockets
@@ -17,13 +25,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SYMBOL        = "BOOM500"
 STAKE         = 1.00
 MULTIPLIER    = 100
-TAKE_PROFIT   = 0.50   # $0.50 de profit
-STOP_LOSS     = 0.50   # $0.50 de loss
-MOMENTUM_N    = 5      # Últimos N deltas para señal momentum
-
-# Estructura de mercado
-SWING_WINDOW  = 20     # Ticks para detectar swings (máximos y mínimos)
-SWING_MIN_N   = 3      # Mínimo de swings para confirmar estructura
+TAKE_PROFIT   = 0.50
+STOP_LOSS     = 0.50
+MOMENTUM_N    = 5
 
 META_DIARIA      = 10.00
 STOP_LOSS_DIARIO = -10.00
@@ -47,8 +51,7 @@ trade_abierto       = False
 contrato_abierto_id = None
 ultimo_ctx          = {}
 
-# Buffer de precios
-precios = deque(maxlen=100)
+precios = deque(maxlen=20)
 
 
 def enviar_telegram(msg):
@@ -76,9 +79,6 @@ def reset_diario():
         fecha_actual = hoy
 
 
-# ══════════════════════════════════════════
-#  SEÑAL 1: MOMENTUM 5 TICKS
-# ══════════════════════════════════════════
 def calcular_momentum():
     if len(precios) < MOMENTUM_N + 1:
         return None
@@ -92,75 +92,6 @@ def calcular_momentum():
     return None
 
 
-# ══════════════════════════════════════════
-#  SEÑAL 2: ESTRUCTURA DE MERCADO
-#  Higher highs/lows → MULTUP
-#  Lower highs/lows  → MULTDOWN
-# ══════════════════════════════════════════
-def detectar_swings(lista):
-    """Detecta máximos y mínimos locales en la lista de precios."""
-    highs = []
-    lows  = []
-    for i in range(1, len(lista) - 1):
-        if lista[i] > lista[i-1] and lista[i] > lista[i+1]:
-            highs.append(lista[i])
-        if lista[i] < lista[i-1] and lista[i] < lista[i+1]:
-            lows.append(lista[i])
-    return highs, lows
-
-
-def calcular_estructura():
-    """
-    Analiza los últimos SWING_WINDOW precios y detecta tendencia.
-    Retorna: 'MULTUP', 'MULTDOWN', o None si no hay estructura clara
-    """
-    if len(precios) < SWING_WINDOW:
-        return None
-
-    lista  = list(precios)[-SWING_WINDOW:]
-    highs, lows = detectar_swings(lista)
-
-    if len(highs) < SWING_MIN_N or len(lows) < SWING_MIN_N:
-        return None  # No hay suficientes swings para analizar
-
-    # Verificar si los últimos highs y lows son crecientes o decrecientes
-    highs_recientes = highs[-SWING_MIN_N:]
-    lows_recientes  = lows[-SWING_MIN_N:]
-
-    hh = all(highs_recientes[i] > highs_recientes[i-1] for i in range(1, len(highs_recientes)))
-    hl = all(lows_recientes[i]  > lows_recientes[i-1]  for i in range(1, len(lows_recientes)))
-    lh = all(highs_recientes[i] < highs_recientes[i-1] for i in range(1, len(highs_recientes)))
-    ll = all(lows_recientes[i]  < lows_recientes[i-1]  for i in range(1, len(lows_recientes)))
-
-    if hh and hl:
-        return "MULTUP"    # Higher highs + higher lows = tendencia alcista
-    elif lh and ll:
-        return "MULTDOWN"  # Lower highs + lower lows = tendencia bajista
-    return None            # Estructura no clara
-
-
-# ══════════════════════════════════════════
-#  SEÑAL COMBINADA
-# ══════════════════════════════════════════
-def calcular_señal():
-    """
-    Solo entra si momentum Y estructura apuntan a la misma dirección.
-    """
-    momentum   = calcular_momentum()
-    estructura = calcular_estructura()
-
-    if momentum is None or estructura is None:
-        return None
-
-    if momentum == estructura:
-        return momentum  # Ambas señales alineadas → entrada
-
-    return None  # Señales contradictorias → no entrar
-
-
-# ══════════════════════════════════════════
-#  ENVÍO DE ORDEN
-# ══════════════════════════════════════════
 async def enviar_orden(ws, direction: str):
     global trade_abierto, ultimo_ctx
 
@@ -193,9 +124,6 @@ async def enviar_orden(ws, direction: str):
     print(f"{emoji} ORDEN | {direction} x{MULTIPLIER} | TP:${TAKE_PROFIT} SL:${STOP_LOSS} | {hora}")
 
 
-# ══════════════════════════════════════════
-#  BOT PRINCIPAL
-# ══════════════════════════════════════════
 async def deriv_bot():
     global balance_actual, moneda, profit_dia, trades_ganados, trades_perdidos
     global bot_pausado, trade_abierto, contrato_abierto_id
@@ -219,12 +147,12 @@ async def deriv_bot():
                         balance_actual = float(raw["authorize"]["balance"])
                         moneda         = raw["authorize"].get("currency", "USD")
 
-                        print(f"🚀 BOOM500 v5 | Saldo: ${balance_actual} {moneda}")
+                        print(f"🚀 BOOM500 v6 | Saldo: ${balance_actual} {moneda}")
                         enviar_telegram(
-                            f"⚡ BOOM500 Momentum + Estructura v5\n"
+                            f"⚡ BOOM500 Momentum Bot v6\n"
                             f"💰 Saldo: ${balance_actual} {moneda}\n"
                             f"⚙️ Stake ${STAKE} | x{MULTIPLIER} | TP ${TAKE_PROFIT} | SL ${STOP_LOSS}\n"
-                            f"🧠 Señal: Momentum {MOMENTUM_N} ticks + Estructura {SWING_WINDOW} ticks\n"
+                            f"🧠 Señal: Momentum {MOMENTUM_N} ticks\n"
                             f"🛡️ SL diario: ${abs(STOP_LOSS_DIARIO)} | Meta: ${META_DIARIA}\n"
                             f"⚠️ Pausa si saldo < ${SALDO_MINIMO}"
                         )
@@ -250,7 +178,7 @@ async def deriv_bot():
                         if trade_abierto:
                             continue
 
-                        direction = calcular_señal()
+                        direction = calcular_momentum()
                         if direction:
                             await enviar_orden(ws, direction)
 
@@ -307,7 +235,6 @@ async def deriv_bot():
                                 bot_pausado = True
 
                         else:
-                            # Contrato activo — solo bloqueamos si tiene current_spot
                             if contract.get("underlying") == SYMBOL and contract.get("current_spot"):
                                 if not trade_abierto:
                                     print(f"🔒 Trade abierto detectado: {contract.get('contract_id')}")
