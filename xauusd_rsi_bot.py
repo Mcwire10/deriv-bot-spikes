@@ -1,15 +1,18 @@
 """
-BOT XAU/USD (ORO) - RSI DIVERGENCIAS + TRAILING STOP M15
-==========================================================
+BOT XAU/USD (ORO) - FUSIÓN DEFINITIVA v2
+==========================================
 Estrategia validada por backtesting:
 - Símbolo: frxXAUUSD (Oro en Deriv)
 - Temporalidad: M15
 - Sesión: Solo Londres (03:00 a 08:00 UTC)
-- Señal: Divergencias RSI con filtro de 4 velas de impulso
-- Solo primer toque de RSI tras cruzar zona neutra (50)
+- Señal: Divergencias RSI con fusión definitiva:
+    * Filtro 4 velas de impulso ANTES del punto 1 (entrada hermano)
+    * Solo primer toque de RSI tras resetear en zona neutra (50)
+    * Filtro anti-spike (velas > 3x promedio descartadas)
+    * Máximo 20 velas entre punto 1 y punto 2
 - Salida: Trailing stop basado en mínimo/máximo de vela M15 anterior
 - Sin Take Profit fijo
-- Backtesting: +48.45R en 3 meses / +19.49R sin el trade más grande
+- Backtesting fusión: +31.56R | Expectancy +0.90R | Drawdown máx -5.44R
 """
 
 import asyncio
@@ -28,21 +31,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 #  PARÁMETROS
 # ══════════════════════════════════════════
 SYMBOL           = "frxXAUUSD"
-STAKE            = 1.00
+STAKE_MINIMO     = 1.00    # Mínimo permitido por Deriv eUSDT
+RIESGO_PCT       = 0.01    # 1% del saldo por trade
 MULTIPLIER       = 100
 RSI_PERIOD       = 14
 RSI_OVERSOLD     = 30
 RSI_OVERBOUGHT   = 70
-RSI_NEUTRAL      = 50
-IMPULSE_CANDLES  = 4      # Velas de impulso requeridas antes de divergencia
-MAX_VELAS_DIV    = 20     # Máximo de velas entre punto 1 y punto 2
-ANTI_SPIKE_MULT  = 3      # Filtro anti-spike: descarta velas > 3x promedio
-GRANULARITY      = 900    # 15 minutos en segundos
-CANDLES_COUNT    = 100    # Velas a pedir para cálculo
+RSI_NEUTRAL_LOW  = 40
+RSI_NEUTRAL_HIGH = 60
+RSI_RESET        = 50
+IMPULSE_CANDLES  = 4      # Velas consecutivas de impulso requeridas
+MAX_VELAS_DIV    = 20     # Máximo velas entre punto 1 y punto 2
+ANTI_SPIKE_MULT  = 3      # Filtro anti-spike
+GRANULARITY      = 900    # M15 en segundos
+CANDLES_COUNT    = 100    # Velas históricas a pedir
 
 # Sesión Londres UTC
-LONDON_START     = 3      # 03:00 UTC
-LONDON_END       = 8      # 08:00 UTC
+LONDON_START     = 3
+LONDON_END       = 8
 
 # Riesgo diario
 META_DIARIA      = 20.00
@@ -65,15 +71,19 @@ fecha_actual        = datetime.now(TZ_UTC).date()
 contratos_vistos    = set()
 trade_abierto       = False
 contrato_abierto_id = None
-trailing_sl_actual  = None   # SL actual del trade abierto
-direction_actual    = None   # Dirección del trade abierto
+trailing_sl_actual  = None
+direction_actual    = None
 ultimo_ctx          = {}
 
-# Estado de señal RSI
-rsi_toco_extremo    = False  # ¿Ya tocó sobrecompra/sobreventa?
-rsi_reseteo_neutro  = False  # ¿Ya volvió a zona neutra?
-punto1              = None   # {"price": x, "rsi": y, "index": i}
-punto2              = None
+# Estado máquina de estados RSI — LONG
+long_buscando_p1     = True   # Esperando primer toque sobreventa
+long_p1              = None   # {"price", "rsi", "index"}
+long_reseteo_neutro  = False  # ¿RSI volvió a zona neutra?
+
+# Estado máquina de estados RSI — SHORT
+short_buscando_p1    = True
+short_p1             = None
+short_reseteo_neutro = False
 
 # Historial de velas
 velas = deque(maxlen=150)
@@ -105,18 +115,31 @@ def reset_diario():
 
 
 def en_sesion_londres():
-    """Retorna True si estamos en horario de Londres (03:00 - 08:00 UTC)"""
     hora = datetime.now(TZ_UTC).hour
     return LONDON_START <= hora < LONDON_END
 
 
+def reset_estado_long():
+    global long_buscando_p1, long_p1, long_reseteo_neutro
+    long_buscando_p1    = True
+    long_p1             = None
+    long_reseteo_neutro = False
+
+
+def reset_estado_short():
+    global short_buscando_p1, short_p1, short_reseteo_neutro
+    short_buscando_p1    = True
+    short_p1             = None
+    short_reseteo_neutro = False
+
+
 # ══════════════════════════════════════════
-#  CÁLCULO RSI
+#  CÁLCULO RSI (Wilder Smoothing)
 # ══════════════════════════════════════════
 def calcular_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    deltas    = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     ganancias = [d if d > 0 else 0 for d in deltas]
     perdidas  = [-d if d < 0 else 0 for d in deltas]
 
@@ -128,41 +151,37 @@ def calcular_rsi(closes, period=14):
         avg_per = (avg_per * (period - 1) + perdidas[i]) / period
 
     if avg_per == 0:
-        return 100
+        return 100.0
     rs  = avg_gan / avg_per
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    return round(100 - (100 / (1 + rs)), 2)
 
 
 # ══════════════════════════════════════════
 #  FILTRO ANTI-SPIKE
 # ══════════════════════════════════════════
-def es_vela_normal(vela, historial):
-    """Retorna True si el cuerpo de la vela no es un spike extremo"""
-    cuerpo = abs(vela["close"] - vela["open"])
-    if len(historial) < 20:
+def es_vela_normal(vela):
+    lista = list(velas)
+    if len(lista) < 20:
         return True
-    cuerpos = [abs(v["close"] - v["open"]) for v in list(historial)[-20:]]
+    cuerpos  = [abs(v["close"] - v["open"]) for v in lista[-20:]]
     promedio = sum(cuerpos) / len(cuerpos)
     if promedio == 0:
         return True
-    return cuerpo <= promedio * ANTI_SPIKE_MULT
+    return abs(vela["close"] - vela["open"]) <= promedio * ANTI_SPIKE_MULT
 
 
 # ══════════════════════════════════════════
-#  FILTRO IMPULSO: 4 VELAS CONSECUTIVAS
+#  FILTRO IMPULSO: N VELAS CONSECUTIVAS
 # ══════════════════════════════════════════
-def hay_impulso_bajista(historial, n=4):
-    """Verifica que las últimas N velas sean bajistas (close < open)"""
-    lista = list(historial)
+def hay_impulso_bajista(n=4):
+    lista = list(velas)
     if len(lista) < n:
         return False
     return all(lista[-(i+1)]["close"] < lista[-(i+1)]["open"] for i in range(n))
 
 
-def hay_impulso_alcista(historial, n=4):
-    """Verifica que las últimas N velas sean alcistas (close > open)"""
-    lista = list(historial)
+def hay_impulso_alcista(n=4):
+    lista = list(velas)
     if len(lista) < n:
         return False
     return all(lista[-(i+1)]["close"] > lista[-(i+1)]["open"] for i in range(n))
@@ -170,106 +189,128 @@ def hay_impulso_alcista(historial, n=4):
 
 # ══════════════════════════════════════════
 #  MÁQUINA DE ESTADOS: DIVERGENCIA RSI
+#  Fusión definitiva — lógica separada LONG/SHORT
 # ══════════════════════════════════════════
-def evaluar_señal(nueva_vela):
+def evaluar_señal(nueva_vela, rsi_val):
     """
-    Evalúa si hay divergencia RSI válida.
+    Evalúa divergencia alcista y bajista de forma independiente.
     Retorna 'MULTUP', 'MULTDOWN' o None.
     """
-    global rsi_toco_extremo, rsi_reseteo_neutro, punto1, punto2
+    global long_buscando_p1, long_p1, long_reseteo_neutro
+    global short_buscando_p1, short_p1, short_reseteo_neutro
 
-    velas.append(nueva_vela)
-    lista   = list(velas)
-    closes  = [v["close"] for v in lista]
-    rsi_val = calcular_rsi(closes)
+    lista = list(velas)
+    idx   = len(lista) - 1
 
-    if rsi_val is None:
-        return None
+    resultado = None
 
-    nueva_vela["rsi"] = rsi_val
+    # ══════════════════════════════════════
+    #  LÓGICA LONG (Divergencia Alcista)
+    # ══════════════════════════════════════
 
-    # ── BUSCAR DIVERGENCIA ALCISTA (LONG) ──────────────
-    # Paso 1: RSI cruza debajo de 30 por primera vez
-    if not rsi_toco_extremo and rsi_val < RSI_OVERSOLD:
-        if hay_impulso_bajista(velas):
-            punto1 = {
-                "price": nueva_vela["low"],
-                "rsi":   rsi_val,
-                "index": len(lista) - 1
-            }
-            rsi_toco_extremo   = True
-            rsi_reseteo_neutro = False
-            print(f"📍 Punto 1 LONG | Precio: {punto1['price']} | RSI: {rsi_val}")
+    # Paso 1: Buscar primer toque de sobreventa CON impulso bajista
+    if long_buscando_p1:
+        if rsi_val < RSI_OVERSOLD and hay_impulso_bajista(IMPULSE_CANDLES):
+            if es_vela_normal(nueva_vela):
+                long_p1 = {
+                    "price": nueva_vela["low"],
+                    "rsi":   rsi_val,
+                    "index": idx
+                }
+                long_buscando_p1    = False
+                long_reseteo_neutro = False
+                print(f"📍 P1 LONG | low={long_p1['price']} RSI={rsi_val}")
 
-    # Paso 2: RSI vuelve a zona neutra
-    elif rsi_toco_extremo and not rsi_reseteo_neutro and rsi_val > RSI_NEUTRAL:
-        rsi_reseteo_neutro = True
-        print(f"↩️ RSI reseteo neutro (LONG)")
+    else:
+        # Paso 2: Esperar que RSI vuelva a zona neutra (cruce de 50)
+        if not long_reseteo_neutro:
+            if rsi_val > RSI_RESET:
+                long_reseteo_neutro = True
+                print(f"↩️ RSI reset neutro (LONG)")
 
-    # Paso 3: RSI vuelve a bajar de 30 → buscar divergencia
-    elif rsi_toco_extremo and rsi_reseteo_neutro and rsi_val < RSI_OVERSOLD:
-        distancia = len(lista) - 1 - punto1["index"]
-        if distancia <= MAX_VELAS_DIV and es_vela_normal(nueva_vela, velas):
-            punto2 = {
-                "price": nueva_vela["low"],
-                "rsi":   rsi_val
-            }
-            # Condición de divergencia alcista
-            if punto2["price"] < punto1["price"] and punto2["rsi"] > punto1["rsi"]:
-                print(f"🎯 DIVERGENCIA ALCISTA | P1: {punto1['price']}/{punto1['rsi']} → P2: {punto2['price']}/{punto2['rsi']}")
-                # Reset estado
-                rsi_toco_extremo = rsi_reseteo_neutro = False
-                punto1 = punto2 = None
-                return "MULTUP"
-            else:
-                # Actualizar punto1 con el nuevo mínimo
-                punto1 = {"price": punto2["price"], "rsi": punto2["rsi"], "index": len(lista) - 1}
-                rsi_reseteo_neutro = False
+        # Paso 3: RSI vuelve a bajar de 30 → evaluar divergencia
+        else:
+            if rsi_val < RSI_OVERSOLD:
+                distancia = idx - long_p1["index"]
 
-    # ── BUSCAR DIVERGENCIA BAJISTA (SHORT) ─────────────
-    # (Lógica espejo para sobrecompra)
-    if not rsi_toco_extremo and rsi_val > RSI_OVERBOUGHT:
-        if hay_impulso_alcista(velas):
-            punto1 = {
-                "price": nueva_vela["high"],
-                "rsi":   rsi_val,
-                "index": len(lista) - 1
-            }
-            rsi_toco_extremo   = True
-            rsi_reseteo_neutro = False
-            print(f"📍 Punto 1 SHORT | Precio: {punto1['price']} | RSI: {rsi_val}")
+                if distancia > MAX_VELAS_DIV:
+                    # Expiró ventana — resetear y guardar como nuevo P1 si hay impulso
+                    print(f"⏰ P1 LONG expirado ({distancia} velas)")
+                    reset_estado_long()
+                    if rsi_val < RSI_OVERSOLD and hay_impulso_bajista(IMPULSE_CANDLES) and es_vela_normal(nueva_vela):
+                        long_p1 = {"price": nueva_vela["low"], "rsi": rsi_val, "index": idx}
+                        long_buscando_p1    = False
+                        long_reseteo_neutro = False
 
-    elif rsi_toco_extremo and not rsi_reseteo_neutro and rsi_val < RSI_NEUTRAL:
-        rsi_reseteo_neutro = True
-        print(f"↩️ RSI reseteo neutro (SHORT)")
+                elif es_vela_normal(nueva_vela):
+                    p2_price = nueva_vela["low"]
+                    p2_rsi   = rsi_val
 
-    elif rsi_toco_extremo and rsi_reseteo_neutro and rsi_val > RSI_OVERBOUGHT:
-        distancia = len(lista) - 1 - punto1["index"]
-        if distancia <= MAX_VELAS_DIV and es_vela_normal(nueva_vela, velas):
-            punto2 = {
-                "price": nueva_vela["high"],
-                "rsi":   rsi_val
-            }
-            if punto2["price"] > punto1["price"] and punto2["rsi"] < punto1["rsi"]:
-                print(f"🎯 DIVERGENCIA BAJISTA | P1: {punto1['price']}/{punto1['rsi']} → P2: {punto2['price']}/{punto2['rsi']}")
-                rsi_toco_extremo = rsi_reseteo_neutro = False
-                punto1 = punto2 = None
-                return "MULTDOWN"
-            else:
-                punto1 = {"price": punto2["price"], "rsi": punto2["rsi"], "index": len(lista) - 1}
-                rsi_reseteo_neutro = False
+                    # Condición de divergencia alcista
+                    if p2_price < long_p1["price"] and p2_rsi > long_p1["rsi"]:
+                        print(f"🎯 DIV ALCISTA | P1: {long_p1['price']}/{long_p1['rsi']} → P2: {p2_price}/{p2_rsi}")
+                        reset_estado_long()
+                        resultado = "MULTUP"
+                    else:
+                        # Actualizar P1 con el nuevo mínimo más bajo
+                        long_p1 = {"price": p2_price, "rsi": p2_rsi, "index": idx}
+                        long_reseteo_neutro = False
+                        print(f"🔄 P1 LONG actualizado: {p2_price}/{p2_rsi}")
 
-    return None
+    # ══════════════════════════════════════
+    #  LÓGICA SHORT (Divergencia Bajista)
+    # ══════════════════════════════════════
+
+    if short_buscando_p1:
+        if rsi_val > RSI_OVERBOUGHT and hay_impulso_alcista(IMPULSE_CANDLES):
+            if es_vela_normal(nueva_vela):
+                short_p1 = {
+                    "price": nueva_vela["high"],
+                    "rsi":   rsi_val,
+                    "index": idx
+                }
+                short_buscando_p1    = False
+                short_reseteo_neutro = False
+                print(f"📍 P1 SHORT | high={short_p1['price']} RSI={rsi_val}")
+
+    else:
+        if not short_reseteo_neutro:
+            if rsi_val < RSI_RESET:
+                short_reseteo_neutro = True
+                print(f"↩️ RSI reset neutro (SHORT)")
+
+        else:
+            if rsi_val > RSI_OVERBOUGHT:
+                distancia = idx - short_p1["index"]
+
+                if distancia > MAX_VELAS_DIV:
+                    print(f"⏰ P1 SHORT expirado ({distancia} velas)")
+                    reset_estado_short()
+                    if rsi_val > RSI_OVERBOUGHT and hay_impulso_alcista(IMPULSE_CANDLES) and es_vela_normal(nueva_vela):
+                        short_p1 = {"price": nueva_vela["high"], "rsi": rsi_val, "index": idx}
+                        short_buscando_p1    = False
+                        short_reseteo_neutro = False
+
+                elif es_vela_normal(nueva_vela):
+                    p2_price = nueva_vela["high"]
+                    p2_rsi   = rsi_val
+
+                    if p2_price > short_p1["price"] and p2_rsi < short_p1["rsi"]:
+                        print(f"🎯 DIV BAJISTA | P1: {short_p1['price']}/{short_p1['rsi']} → P2: {p2_price}/{p2_rsi}")
+                        reset_estado_short()
+                        resultado = "MULTDOWN"
+                    else:
+                        short_p1 = {"price": p2_price, "rsi": p2_rsi, "index": idx}
+                        short_reseteo_neutro = False
+                        print(f"🔄 P1 SHORT actualizado: {p2_price}/{p2_rsi}")
+
+    return resultado
 
 
 # ══════════════════════════════════════════
-#  TRAILING STOP: ACTUALIZAR SL
+#  TRAILING STOP: ACTUALIZAR SL VÍA API
 # ══════════════════════════════════════════
 async def actualizar_trailing_stop(ws):
-    """
-    Al cierre de cada vela M15, mueve el SL al mínimo/máximo
-    de la vela anterior según la dirección del trade.
-    """
     global trailing_sl_actual
 
     if not trade_abierto or contrato_abierto_id is None:
@@ -282,33 +323,36 @@ async def actualizar_trailing_stop(ws):
     vela_anterior = lista[-2]
 
     if direction_actual == "MULTUP":
+        # SL sube al mínimo de la vela anterior
         nuevo_sl_precio = vela_anterior["low"]
-        # Convertir precio a P&L en dólares
-        # Con Multiplier x100 y stake $1: P&L = (precio_actual - entrada) / entrada * 100 * stake
-        # El SL en Deriv Multipliers se expresa en dólares de pérdida máxima
-        # Usamos un SL conservador en dólares basado en distancia de precio
-        nuevo_sl = round(abs(nuevo_sl_precio - vela_anterior["close"]) * MULTIPLIER, 2)
-        nuevo_sl = max(nuevo_sl, 0.10)  # Mínimo $0.10
+        vela_actual     = lista[-1]
+        distancia_pts   = abs(vela_actual["close"] - nuevo_sl_precio)
+        nuevo_sl_usd    = max(round(distancia_pts * MULTIPLIER, 2), 0.10)
 
     elif direction_actual == "MULTDOWN":
+        # SL baja al máximo de la vela anterior
         nuevo_sl_precio = vela_anterior["high"]
-        nuevo_sl = round(abs(nuevo_sl_precio - vela_anterior["close"]) * MULTIPLIER, 2)
-        nuevo_sl = max(nuevo_sl, 0.10)
+        vela_actual     = lista[-1]
+        distancia_pts   = abs(nuevo_sl_precio - vela_actual["close"])
+        nuevo_sl_usd    = max(round(distancia_pts * MULTIPLIER, 2), 0.10)
 
     else:
         return
 
-    # Solo actualizar si el nuevo SL es mejor que el anterior
-    if trailing_sl_actual is None or nuevo_sl < trailing_sl_actual:
-        trailing_sl_actual = nuevo_sl
-        await ws.send(json.dumps({
-            "contract_update": 1,
-            "contract_id": contrato_abierto_id,
-            "limit_order": {
-                "stop_loss": trailing_sl_actual
-            }
-        }))
-        print(f"🔄 Trailing SL actualizado: ${trailing_sl_actual}")
+    # Solo mover SL si mejora (reduce el riesgo)
+    if trailing_sl_actual is None or nuevo_sl_usd < trailing_sl_actual:
+        trailing_sl_actual = nuevo_sl_usd
+        try:
+            await ws.send(json.dumps({
+                "contract_update": 1,
+                "contract_id": contrato_abierto_id,
+                "limit_order": {
+                    "stop_loss": trailing_sl_actual
+                }
+            }))
+            print(f"🔄 Trailing SL → ${trailing_sl_actual}")
+        except Exception as e:
+            print(f"⚠️ Error actualizando trailing stop: {e}")
 
 
 # ══════════════════════════════════════════
@@ -317,7 +361,10 @@ async def actualizar_trailing_stop(ws):
 async def enviar_orden(ws, direction: str, sl_inicial: float):
     global trade_abierto, direction_actual, trailing_sl_actual, ultimo_ctx
 
-    emoji = "🟢" if direction == "MULTUP" else "🔴"
+    emoji  = "🟢" if direction == "MULTUP" else "🔴"
+    stake  = calcular_stake(sl_inicial)
+    riesgo = round(stake * sl_inicial, 2)
+
     trade_abierto      = True
     direction_actual   = direction
     trailing_sl_actual = sl_inicial
@@ -326,14 +373,15 @@ async def enviar_orden(ws, direction: str, sl_inicial: float):
     ultimo_ctx = {
         "direction": direction,
         "hora": hora,
-        "sl_inicial": sl_inicial
+        "sl_inicial": sl_inicial,
+        "stake": stake
     }
 
     await ws.send(json.dumps({
         "buy": 1,
-        "price": STAKE,
+        "price": stake,
         "parameters": {
-            "amount": STAKE,
+            "amount": stake,
             "basis": "stake",
             "contract_type": direction,
             "currency": moneda,
@@ -341,17 +389,37 @@ async def enviar_orden(ws, direction: str, sl_inicial: float):
             "symbol": SYMBOL,
             "limit_order": {
                 "stop_loss": sl_inicial
-                # Sin take_profit — trailing stop manual
             }
         }
     }))
 
-    print(f"{emoji} ORDEN XAU/USD | {direction} x{MULTIPLIER} | SL inicial: ${sl_inicial} | {hora}")
+    print(f"{emoji} ORDEN XAU/USD | {direction} x{MULTIPLIER} | Stake: ${stake} | SL: ${sl_inicial} | Riesgo: ${riesgo} | {hora}")
+    enviar_telegram(
+        f"{emoji} ORDEN XAU/USD\n"
+        f"📊 {direction} x{MULTIPLIER}\n"
+        f"⏱ {hora}\n"
+        f"💵 Stake: ${stake} (1% de ${balance_actual})\n"
+        f"🛡️ SL: ${sl_inicial} | Riesgo: ${riesgo}\n"
+        f"💰 Saldo: ${balance_actual} {moneda}"
+    )
 
 
 # ══════════════════════════════════════════
 #  PEDIR VELAS M15
 # ══════════════════════════════════════════
+def calcular_stake(sl_usd: float) -> float:
+    """
+    Calcula el stake para arriesgar exactamente RIESGO_PCT del saldo.
+    stake = (saldo * riesgo%) / sl_usd
+    Respeta el mínimo de Deriv ($1.00).
+    """
+    if balance_actual is None or balance_actual <= 0 or sl_usd <= 0:
+        return STAKE_MINIMO
+    stake = (balance_actual * RIESGO_PCT) / sl_usd
+    stake = max(round(stake, 2), STAKE_MINIMO)
+    return stake
+
+
 async def pedir_velas(ws):
     await ws.send(json.dumps({
         "ticks_history": SYMBOL,
@@ -391,20 +459,20 @@ async def deriv_bot():
                         balance_actual = float(raw["authorize"]["balance"])
                         moneda         = raw["authorize"].get("currency", "USD")
 
-                        print(f"🚀 XAU/USD BOT | Saldo: ${balance_actual} {moneda}")
+                        print(f"🚀 XAU/USD BOT v2 | Saldo: ${balance_actual} {moneda}")
                         enviar_telegram(
-                            f"⚡ XAU/USD Divergencias RSI\n"
+                            f"⚡ XAU/USD Fusión Definitiva v2\n"
                             f"💰 Saldo: ${balance_actual} {moneda}\n"
-                            f"⚙️ Stake ${STAKE} | x{MULTIPLIER} | Sin TP fijo\n"
-                            f"🧠 RSI {RSI_PERIOD} | M15 | Solo Londres 03-08 UTC\n"
+                            f"⚙️ Stake dinámico 1% | x{MULTIPLIER} | Sin TP fijo\n"
+                            f"🧠 RSI {RSI_PERIOD} | M15 | Londres 03-08 UTC\n"
+                            f"🔬 Filtro: 4 velas impulso + primer toque RSI\n"
                             f"🛡️ SL diario: ${abs(STOP_LOSS_DIARIO)} | Meta: ${META_DIARIA}"
                         )
                         await pedir_velas(ws)
                         await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
 
-                    # ── VELAS M15 ─────────────────────────────
+                    # ── VELAS M15: CARGA INICIAL ───────────────
                     if "candles" in raw:
-                        # Carga inicial de velas históricas
                         for c in raw["candles"]:
                             velas.append({
                                 "open":  float(c["open"]),
@@ -415,6 +483,7 @@ async def deriv_bot():
                             })
                         print(f"📊 {len(velas)} velas M15 cargadas")
 
+                    # ── VELAS M15: STREAMING ───────────────────
                     if "ohlc" in raw and not bot_pausado:
                         reset_diario()
 
@@ -435,23 +504,35 @@ async def deriv_bot():
                             "epoch": c["epoch"]
                         }
 
-                        # Actualizar trailing stop en cada vela nueva
+                        velas.append(nueva_vela)
+                        closes  = [v["close"] for v in list(velas)]
+                        rsi_val = calcular_rsi(closes)
+
+                        if rsi_val is None:
+                            continue
+
+                        # Actualizar trailing stop si hay trade abierto
                         if trade_abierto:
                             await actualizar_trailing_stop(ws)
                             continue
 
-                        direction = evaluar_señal(nueva_vela)
+                        # Evaluar señal
+                        direction = evaluar_señal(nueva_vela, rsi_val)
                         if direction:
-                            # SL inicial = distancia entre punto2 y close actual
                             lista = list(velas)
                             if direction == "MULTUP":
-                                sl_pts  = abs(lista[-1]["close"] - lista[-1]["low"])
-                                sl_usd  = max(round(sl_pts * MULTIPLIER, 2), 0.50)
+                                sl_pts = abs(lista[-1]["close"] - lista[-1]["low"])
                             else:
-                                sl_pts  = abs(lista[-1]["high"] - lista[-1]["close"])
-                                sl_usd  = max(round(sl_pts * MULTIPLIER, 2), 0.50)
+                                sl_pts = abs(lista[-1]["high"] - lista[-1]["close"])
 
+                            sl_usd = max(round(sl_pts * MULTIPLIER, 2), 0.50)
                             await enviar_orden(ws, direction, sl_usd)
+
+                    # ── CONFIRMAR CONTRACT ID ──────────────────
+                    if "buy" in raw:
+                        if "contract_id" in raw.get("buy", {}):
+                            contrato_abierto_id = raw["buy"]["contract_id"]
+                            print(f"✅ Contrato confirmado: {contrato_abierto_id}")
 
                     # ── CONTRATOS ─────────────────────────────
                     if "proposal_open_contract" in raw:
@@ -513,11 +594,6 @@ async def deriv_bot():
                                     print(f"🔒 Trade abierto detectado: {contract.get('contract_id')}")
                                 trade_abierto       = True
                                 contrato_abierto_id = contract.get("contract_id")
-
-                        # Confirmar contract_id al abrir
-                        if "buy" in raw:
-                            contrato_abierto_id = raw["buy"].get("contract_id")
-                            print(f"✅ Contrato abierto: {contrato_abierto_id}")
 
         except Exception as e:
             print(f"⚠️ Desconexión. Reconectando en 5s: {e}")
