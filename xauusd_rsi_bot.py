@@ -1,18 +1,17 @@
 """
-BOT XAU/USD (ORO) - FUSIÓN DEFINITIVA v2
-==========================================
+BOT XAU/USD (ORO) - 3 SESIONES v3
+====================================
 Estrategia validada por backtesting:
-- Símbolo: frxXAUUSD (Oro en Deriv)
+- Símbolo: frxXAUUSD
 - Temporalidad: M15
-- Sesión: Solo Londres (03:00 a 08:00 UTC)
-- Señal: Divergencias RSI con fusión definitiva:
-    * Filtro 4 velas de impulso ANTES del punto 1 (entrada hermano)
-    * Solo primer toque de RSI tras resetear en zona neutra (50)
-    * Filtro anti-spike (velas > 3x promedio descartadas)
-    * Máximo 20 velas entre punto 1 y punto 2
-- Salida: Trailing stop basado en mínimo/máximo de vela M15 anterior
-- Sin Take Profit fijo
-- Backtesting fusión: +31.56R | Expectancy +0.90R | Drawdown máx -5.44R
+- Entrada: Divergencias RSI + filtro 4 velas impulso + primer toque
+
+SESIONES:
+  Asia    00:00-03:00 UTC → TP fijo 1:1  | +2.00R  | Expectancy +0.07R
+  Londres 03:00-08:00 UTC → Trailing M15 | +31.56R | Expectancy +0.90R
+  NY      13:00-20:00 UTC → Trailing M15 | +23.20R | Expectancy +0.89R
+
+Total backtesting: +56.76R en 3 meses
 """
 
 import asyncio
@@ -46,9 +45,12 @@ ANTI_SPIKE_MULT  = 3      # Filtro anti-spike
 GRANULARITY      = 900    # M15 en segundos
 CANDLES_COUNT    = 100    # Velas históricas a pedir
 
-# Sesión Londres UTC
-LONDON_START     = 3
-LONDON_END       = 8
+# Sesiones UTC
+SESIONES = {
+    "asia":    {"start": 0,  "end": 3,  "trailing": False, "tp_ratio": 1.0},
+    "londres": {"start": 3,  "end": 8,  "trailing": True,  "tp_ratio": None},
+    "ny":      {"start": 13, "end": 20, "trailing": True,  "tp_ratio": None},
+}
 
 # Riesgo diario
 META_DIARIA      = 20.00
@@ -114,9 +116,13 @@ def reset_diario():
         fecha_actual = hoy
 
 
-def en_sesion_londres():
+def sesion_activa():
+    """Retorna el nombre de la sesión activa o None si no hay ninguna."""
     hora = datetime.now(TZ_UTC).hour
-    return LONDON_START <= hora < LONDON_END
+    for nombre, s in SESIONES.items():
+        if s["start"] <= hora < s["end"]:
+            return nombre
+    return None
 
 
 def reset_estado_long():
@@ -358,12 +364,13 @@ async def actualizar_trailing_stop(ws):
 # ══════════════════════════════════════════
 #  ENVÍO DE ORDEN
 # ══════════════════════════════════════════
-async def enviar_orden(ws, direction: str, sl_inicial: float):
+async def enviar_orden(ws, direction: str, sl_inicial: float, sesion: str):
     global trade_abierto, direction_actual, trailing_sl_actual, ultimo_ctx
 
     emoji  = "🟢" if direction == "MULTUP" else "🔴"
     stake  = calcular_stake(sl_inicial)
     riesgo = round(stake * sl_inicial, 2)
+    config = SESIONES[sesion]
 
     trade_abierto      = True
     direction_actual   = direction
@@ -374,8 +381,16 @@ async def enviar_orden(ws, direction: str, sl_inicial: float):
         "direction": direction,
         "hora": hora,
         "sl_inicial": sl_inicial,
-        "stake": stake
+        "stake": stake,
+        "sesion": sesion,
+        "trailing": config["trailing"]
     }
+
+    # Para Asia: TP fijo 1:1. Para Londres/NY: sin TP
+    limit_order = {"stop_loss": sl_inicial}
+    if not config["trailing"] and config["tp_ratio"]:
+        tp_usd = round(sl_inicial * config["tp_ratio"], 2)
+        limit_order["take_profit"] = tp_usd
 
     await ws.send(json.dumps({
         "buy": 1,
@@ -387,20 +402,22 @@ async def enviar_orden(ws, direction: str, sl_inicial: float):
             "currency": moneda,
             "multiplier": MULTIPLIER,
             "symbol": SYMBOL,
-            "limit_order": {
-                "stop_loss": sl_inicial
-            }
+            "limit_order": limit_order
         }
     }))
 
-    print(f"{emoji} ORDEN XAU/USD | {direction} x{MULTIPLIER} | Stake: ${stake} | SL: ${sl_inicial} | Riesgo: ${riesgo} | {hora}")
+    sesion_emoji = {"asia": "🌏", "londres": "🇬🇧", "ny": "🇺🇸"}[sesion]
+    salida = f"TP fijo 1:1 (${limit_order.get('take_profit','?')})" if not config["trailing"] else "Trailing Stop M15"
+
+    print(f"{emoji} ORDEN | {direction} x{MULTIPLIER} | {sesion.upper()} | Stake: ${stake} | SL: ${sl_inicial} | {hora}")
     enviar_telegram(
         f"{emoji} ORDEN XAU/USD\n"
+        f"{sesion_emoji} Sesión: {sesion.upper()}\n"
         f"📊 {direction} x{MULTIPLIER}\n"
         f"⏱ {hora}\n"
         f"💵 Stake: ${stake} (1% de ${balance_actual})\n"
         f"🛡️ SL: ${sl_inicial} | Riesgo: ${riesgo}\n"
-        f"💰 Saldo: ${balance_actual} {moneda}"
+        f"🎯 Salida: {salida}"
     )
 
 
@@ -461,11 +478,12 @@ async def deriv_bot():
 
                         print(f"🚀 XAU/USD BOT v2 | Saldo: ${balance_actual} {moneda}")
                         enviar_telegram(
-                            f"⚡ XAU/USD Fusión Definitiva v2\n"
+                            f"⚡ XAU/USD Bot 3 Sesiones v3\n"
                             f"💰 Saldo: ${balance_actual} {moneda}\n"
-                            f"⚙️ Stake dinámico 1% | x{MULTIPLIER} | Sin TP fijo\n"
-                            f"🧠 RSI {RSI_PERIOD} | M15 | Londres 03-08 UTC\n"
-                            f"🔬 Filtro: 4 velas impulso + primer toque RSI\n"
+                            f"⚙️ Stake dinámico 1% | x{MULTIPLIER}\n"
+                            f"🌏 Asia    00-03 UTC → TP fijo 1:1\n"
+                            f"🇬🇧 Londres 03-08 UTC → Trailing M15\n"
+                            f"🇺🇸 NY      13-20 UTC → Trailing M15\n"
                             f"🛡️ SL diario: ${abs(STOP_LOSS_DIARIO)} | Meta: ${META_DIARIA}"
                         )
                         await pedir_velas(ws)
@@ -492,7 +510,8 @@ async def deriv_bot():
                             bot_pausado = True
                             continue
 
-                        if not en_sesion_londres():
+                        sesion = sesion_activa()
+                        if sesion is None:
                             continue
 
                         c = raw["ohlc"]
@@ -511,22 +530,22 @@ async def deriv_bot():
                         if rsi_val is None:
                             continue
 
-                        # Actualizar trailing stop si hay trade abierto
                         if trade_abierto:
-                            await actualizar_trailing_stop(ws)
+                            config = SESIONES[ultimo_ctx.get("sesion", sesion)]
+                            if config["trailing"]:
+                                await actualizar_trailing_stop(ws)
                             continue
 
-                        # Evaluar señal
                         direction = evaluar_señal(nueva_vela, rsi_val)
                         if direction:
-                            lista = list(velas)
+                            lista  = list(velas)
                             if direction == "MULTUP":
                                 sl_pts = abs(lista[-1]["close"] - lista[-1]["low"])
                             else:
                                 sl_pts = abs(lista[-1]["high"] - lista[-1]["close"])
 
                             sl_usd = max(round(sl_pts * MULTIPLIER, 2), 0.50)
-                            await enviar_orden(ws, direction, sl_usd)
+                            await enviar_orden(ws, direction, sl_usd, sesion)
 
                     # ── CONFIRMAR CONTRACT ID ──────────────────
                     if "buy" in raw:
