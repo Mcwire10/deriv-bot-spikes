@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 #  PARÁMETROS
 # ══════════════════════════════════════════
 SYMBOL           = "frxXAUUSD"
-STAKE_MINIMO     = 1.00    # Mínimo permitido por Deriv eUSDT
+STAKE_MINIMO     = 2.00    # Mínimo permitido por Deriv eUSDT para XAU/USD
 RIESGO_PCT       = 0.01    # 1% del saldo por trade
 MULTIPLIER       = 100
 RSI_PERIOD       = 14
