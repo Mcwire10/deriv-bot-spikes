@@ -102,8 +102,8 @@ ASSETS = {
     # ── US500 — Trend-Following Pullback ─────────────────────────
     # WR 64% | R 1:1.5 | confianza 90%
     # Gemini: NY M5, 15:00-19:00 UTC, EMA cross + precio > prev high, filtro volumen
-    # SIMBOLO: verificar en Deriv — puede ser "frxUS500", "OTC_US500" u otro
-    "frxUS500": {
+    # Simbolo confirmado: otc_SPC (WebSocket API Deriv, product_type basic)
+    "otc_SPC": {
         "name": "US SP 500",
         "granularity": 300,              # M5
         "strategy": "ema_trend_pullback",
