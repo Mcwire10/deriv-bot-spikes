@@ -30,8 +30,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 #  PARÁMETROS
 # ══════════════════════════════════════════
 SYMBOL           = "frxXAUUSD"
-STAKE_MINIMO     = 2.00    # Mínimo permitido por Deriv eUSDT para XAU/USD
-SL_MAXIMO_USD    = 3.00    # SL máximo en dólares para proteger la cuenta
+STAKE_MINIMO     = 2.00    # Mínimo para frxXAUUSD en eUSDT
+SL_MAX_PCT       = 0.90    # SL máximo = 90% del stake (deja margen antes del stop out)
 RIESGO_PCT       = 0.01    # 1% del saldo por trade
 MULTIPLIER       = 100
 RSI_PERIOD       = 14
@@ -369,8 +369,8 @@ async def enviar_orden(ws, direction: str, sl_inicial: float, sesion: str):
     global trade_abierto, direction_actual, trailing_sl_actual, ultimo_ctx
 
     emoji  = "🟢" if direction == "MULTUP" else "🔴"
-    stake  = calcular_stake(sl_inicial)
-    riesgo = round(stake * sl_inicial, 2)
+    stake  = calcular_stake(1.00)
+    riesgo = round(sl_inicial, 2)
     config = SESIONES[sesion]
 
     trade_abierto      = True
@@ -545,7 +545,8 @@ async def deriv_bot():
                             else:
                                 sl_pts = abs(lista[-1]["high"] - lista[-1]["close"])
 
-                            sl_usd = min(max(round(sl_pts * MULTIPLIER, 2), 0.50), SL_MAXIMO_USD)
+                            stake  = calcular_stake(1.00)  # calcular stake primero
+                            sl_usd = round(stake * SL_MAX_PCT, 2)  # SL = 90% del stake
                             await enviar_orden(ws, direction, sl_usd, sesion)
 
                     # ── CONFIRMAR CONTRACT ID ──────────────────
