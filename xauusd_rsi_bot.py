@@ -365,26 +365,25 @@ async def actualizar_trailing_stop(ws):
 # ══════════════════════════════════════════
 #  ENVÍO DE ORDEN
 # ══════════════════════════════════════════
-async def enviar_orden(ws, direction: str, sl_inicial: float, sesion: str):
+async def enviar_orden(ws, direction: str, sl_inicial: float, stake: float, sesion: str):
     global trade_abierto, direction_actual, trailing_sl_actual, ultimo_ctx
 
     emoji  = "🟢" if direction == "MULTUP" else "🔴"
-    stake  = calcular_stake(1.00)
     riesgo = round(sl_inicial, 2)
     config = SESIONES[sesion]
+    hora   = datetime.now(TZ_UTC).strftime("%H:%M UTC")
 
     trade_abierto      = True
     direction_actual   = direction
     trailing_sl_actual = sl_inicial
-    hora = datetime.now(TZ_UTC).strftime("%H:%M UTC")
 
     ultimo_ctx = {
         "direction": direction,
-        "hora": hora,
+        "hora":      hora,
         "sl_inicial": sl_inicial,
-        "stake": stake,
-        "sesion": sesion,
-        "trailing": config["trailing"]
+        "stake":     stake,
+        "sesion":    sesion,
+        "trailing":  config["trailing"]
     }
 
     # Para Asia: TP fijo 1:1. Para Londres/NY: sin TP
@@ -539,15 +538,9 @@ async def deriv_bot():
 
                         direction = evaluar_señal(nueva_vela, rsi_val)
                         if direction:
-                            lista  = list(velas)
-                            if direction == "MULTUP":
-                                sl_pts = abs(lista[-1]["close"] - lista[-1]["low"])
-                            else:
-                                sl_pts = abs(lista[-1]["high"] - lista[-1]["close"])
-
-                            stake  = calcular_stake(1.00)  # calcular stake primero
-                            sl_usd = round(stake * SL_MAX_PCT, 2)  # SL = 90% del stake
-                            await enviar_orden(ws, direction, sl_usd, sesion)
+                            stake  = calcular_stake(1.00)
+                            sl_usd = round(stake * SL_MAX_PCT, 2)
+                            await enviar_orden(ws, direction, sl_usd, stake, sesion)
 
                     # ── CONFIRMAR CONTRACT ID ──────────────────
                     if "buy" in raw:
@@ -612,7 +605,21 @@ async def deriv_bot():
                         else:
                             if contract.get("underlying") == SYMBOL and contract.get("current_spot"):
                                 if not trade_abierto:
-                                    print(f"🔒 Trade abierto detectado: {contract.get('contract_id')}")
+                                    cid  = contract.get("contract_id")
+                                    hora = datetime.now(TZ_UTC).strftime("%H:%M UTC")
+                                    sesion_actual = sesion_activa() or "londres"
+                                    # Reconstruir ultimo_ctx desde el contrato
+                                    ct = contract.get("contract_type", "MULTDOWN")
+                                    sl = abs(float(contract.get("limit_order", {}).get("stop_loss", {}).get("order_amount", 1.80)))
+                                    ultimo_ctx = {
+                                        "direction": ct,
+                                        "hora":      hora,
+                                        "sl_inicial": sl,
+                                        "stake":     float(contract.get("buy_price", 2.00)),
+                                        "sesion":    sesion_actual,
+                                        "trailing":  SESIONES[sesion_actual]["trailing"]
+                                    }
+                                    print(f"🔒 Trade abierto detectado: {cid} | {ct} | SL: ${sl}")
                                 trade_abierto       = True
                                 contrato_abierto_id = contract.get("contract_id")
 
