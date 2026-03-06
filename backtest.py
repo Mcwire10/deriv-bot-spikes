@@ -1,16 +1,32 @@
 """
-backtest.py v2 — RSI Divergencias + SMC comparativo
-=====================================================
-Tests:
-  Gold XAU/USD M15 — SMC v9 vs RSI Divergencias original (+48R)
-  EUR/USD M15       — RSI Divergencias (sesion Londres)
-  GBP/USD M15       — RSI Divergencias (sesion Londres)
-  GBP/JPY M30       — RSI Divergencias (sesion Asia/Londres)
-  Silver XAG/USD M15— RSI Divergencias (sesion NY)
+backtest_eurusd.py — Búsqueda de edge en EUR/USD
+=================================================
+
+DIAGNÓSTICO:
+  El problema del EUR/USD no es la dirección — es el ATR.
+  EUR/USD tiene el ATR más chico de todos los pares (~7-12 pips M15).
+  El trailing optimizado pone el SL Stage2 MÁS LEJOS que el move total.
+  → Todo cierra en break-even o timeout.
+
+SOLUCIÓN: TP FIJO + estrategias adaptadas a mean reversion y breakouts.
+
+3 ESTRATEGIAS:
+
+  A) Bollinger Mean Reversion (M15, Londres 08-12)
+     EUR/USD revierte al promedio ~70% del tiempo.
+     TP = banda media | SL = 0.5 ATR más allá de la banda
+
+  B) London Session Breakout (M5, 08:00-08:45 UTC)
+     Rango Asia 00-08 → breakout al abrir Londres.
+     TP = 1.5x rango | SL = 0.25x rango. RR 4:1+
+
+  C) RSI Divergencias H1 + TP fijo 2R (overlap 10-14 UTC)
+     Misma lógica del gold bot pero en H1 (menos ruido).
+     H1 filtra el ruido que destruye las señales en M15.
 
 Uso:
-  python backtest.py --months 3
-  python backtest.py --months 6
+  python backtest_eurusd.py --months 6
+  python backtest_eurusd.py --months 12
 """
 
 import asyncio
@@ -26,76 +42,38 @@ DERIV_WS_URL       = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 DERIV_API_TOKEN    = os.environ.get("DERIV_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-ASSETS = {
-    "frxXAUUSD_SMC": {
-        "symbol": "frxXAUUSD", "name": "Gold SMC v9",
-        "granularity": 900, "strategy": "smc",
-        "session": (3, 20), "multiplier": 100, "stake": 2.0, "sl_atr_mult": 0.5,
-    },
-    "frxXAUUSD_RSI": {
-        "symbol": "frxXAUUSD", "name": "Gold RSI Div",
-        "granularity": 900, "strategy": "rsi_divergence",
-        "session": (3, 12), "multiplier": 100, "stake": 2.0,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxEURUSD": {
-        "symbol": "frxEURUSD", "name": "EUR/USD RSI Div",
-        "granularity": 900, "strategy": "rsi_divergence",
-        "session": (8, 12), "multiplier": 100, "stake": 1.0,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxGBPUSD": {
-        "symbol": "frxGBPUSD", "name": "GBP/USD RSI Div",
-        "granularity": 900, "strategy": "rsi_divergence",
-        "session": (8, 12), "multiplier": 100, "stake": 1.0,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxGBPJPY": {
-        "symbol": "frxGBPJPY", "name": "GBP/JPY RSI Div",
-        "granularity": 1800, "strategy": "rsi_divergence",
-        "session": (6, 9), "multiplier": 100, "stake": 1.0,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxXAGUSD": {
-        "symbol": "frxXAGUSD", "name": "Silver RSI Div",
-        "granularity": 900, "strategy": "rsi_divergence",
-        "session": (13, 17), "multiplier": 100, "stake": 1.0,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-}
+SYMBOL             = "frxEURUSD"
+STAKE              = 1.0
+MULTIPLIER         = 100
 
 # ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
 async def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[Telegram] {msg[:120]}")
+        print(f"[TG] {msg[:100]}")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         async with aiohttp.ClientSession() as s:
-            await s.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            await s.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+            )
     except Exception as e:
-        print(f"[Telegram error] {e}")
+        print(f"[TG error] {e}")
 
 # ─────────────────────────────────────────────
-# DESCARGA DE DATOS
+# DESCARGA
 # ─────────────────────────────────────────────
-async def fetch_candles(symbol: str, granularity: int, months: int) -> list:
-    all_candles  = []
-    end_time     = int(datetime.now(timezone.utc).timestamp())
-    candles_need = (months * 30 * 24 * 3600) // granularity
-    batch_size   = 5000
-    batches      = max(1, int(np.ceil(candles_need / batch_size)))
-    current_end  = end_time
+async def fetch_candles(granularity: int, months: int) -> list:
+    all_c       = []
+    end_time    = int(datetime.now(timezone.utc).timestamp())
+    need        = (months * 30 * 24 * 3600) // granularity
+    batches     = max(1, int(np.ceil(need / 5000)))
+    current_end = end_time
+    gran_label  = {300: "M5", 900: "M15", 3600: "H1"}.get(granularity, f"{granularity}s")
 
-    print(f"[fetch] {symbol} | gran:{granularity}s | ~{candles_need} velas | {batches} batch(es)")
+    print(f"[fetch] {SYMBOL} {gran_label} | ~{need} velas | {batches} batch(es)")
 
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
@@ -105,8 +83,8 @@ async def fetch_candles(symbol: str, granularity: int, months: int) -> list:
 
             for b in range(batches):
                 await ws.send(json.dumps({
-                    "ticks_history": symbol, "adjust_start_time": 1,
-                    "count": batch_size, "end": current_end,
+                    "ticks_history": SYMBOL, "adjust_start_time": 1,
+                    "count": 5000, "end": current_end,
                     "granularity": granularity, "style": "candles",
                 }))
                 while True:
@@ -118,26 +96,24 @@ async def fetch_candles(symbol: str, granularity: int, months: int) -> list:
                              "epoch": int(c["epoch"])}
                             for c in raw.get("candles", [])
                         ]
-                        all_candles = parsed + all_candles
+                        all_c = parsed + all_c
                         if parsed: current_end = parsed[0]["epoch"] - 1
-                        print(f"  batch {b+1}/{batches} — {len(parsed)} velas | total: {len(all_candles)}")
+                        print(f"  batch {b+1}/{batches} — {len(parsed)} velas | total: {len(all_c)}")
                         break
                     if raw.get("error"):
-                        print(f"  Error: {raw['error']['message']}")
-                        return all_candles
+                        print(f"  Error Deriv: {raw['error']['message']}")
+                        return all_c
                 await asyncio.sleep(0.5)
-
     except Exception as e:
-        print(f"[fetch error] {symbol}: {e}")
+        print(f"[fetch error] {e}")
 
-    all_candles.sort(key=lambda c: c["epoch"])
+    all_c.sort(key=lambda c: c["epoch"])
     seen, unique = set(), []
-    for c in all_candles:
+    for c in all_c:
         if c["epoch"] not in seen:
             seen.add(c["epoch"])
             unique.append(c)
-
-    print(f"[fetch] {symbol} — {len(unique)} velas unicas")
+    print(f"[fetch] {gran_label} — {len(unique)} velas unicas\n")
     return unique
 
 # ─────────────────────────────────────────────
@@ -149,15 +125,8 @@ def calc_atr(candles, period=14):
            for c, p in zip(candles[1:], candles)]
     return float(np.mean(trs[-period:]))
 
-def calc_ema(values, period):
-    if len(values) < period: return []
-    k, out = 2 / (period + 1), []
-    for i, v in enumerate(values):
-        out.append(float(v) if i == 0 else float(v) * k + out[-1] * (1 - k))
-    return out
-
 def calc_rsi(closes, period=14):
-    arr = np.array(closes, dtype=float)
+    arr = np.array(closes[-period*3:], dtype=float)
     if len(arr) < period + 1: return None
     d  = np.diff(arr)
     ag = np.mean(np.where(d > 0, d, 0.0)[-period:])
@@ -165,240 +134,274 @@ def calc_rsi(closes, period=14):
     if al == 0: return 100.0
     return float(100 - 100 / (1 + ag / al))
 
+def calc_bollinger(closes, period=20, std_mult=2.0):
+    if len(closes) < period: return None, None, None
+    arr = np.array(closes[-period:], dtype=float)
+    mid = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1))
+    return mid - std * std_mult, mid, mid + std * std_mult
+
 def avg_body(candles, period=20):
     if len(candles) < period: return 0
     return float(np.mean([abs(c["close"] - c["open"]) for c in candles[-period:]]))
 
-def in_session(epoch: int, session: tuple) -> bool:
+def in_session(epoch, h_start, h_end):
     h = datetime.fromtimestamp(epoch, tz=timezone.utc).hour
-    return session[0] <= h < session[1]
+    return h_start <= h < h_end
+
+def day_of(epoch):
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).date()
 
 # ─────────────────────────────────────────────
-# ESTRATEGIA 1 — SMC v9
+# SIMULACIÓN — TP FIJO
+# EUR/USD: NO trailing. Los moves son demasiado pequeños.
 # ─────────────────────────────────────────────
-def strat_smc(candles, sl_atr_mult=0.5):
-    if len(candles) < 50: return None
-    atr    = calc_atr(candles)
-    if not atr: return None
+def simulate_fixed_tp(candles_after, direction, entry, sl, tp, stake, mult, max_c=300):
+    for i, c in enumerate(candles_after[:max_c]):
+        hit_sl = c["low"] <= sl if direction == "LONG" else c["high"] >= sl
+        hit_tp = c["high"] >= tp if direction == "LONG" else c["low"] <= tp
+
+        if hit_tp and hit_sl:
+            # Ambas en la misma vela — la que va primero gana
+            # Si LONG y vela alcista → TP primero; si bajista → SL primero
+            hit_tp_first = (c["close"] >= c["open"]) if direction == "LONG" else (c["close"] <= c["open"])
+            exit_p = tp if hit_tp_first else sl
+        elif hit_tp:
+            exit_p = tp
+        elif hit_sl:
+            exit_p = sl
+        else:
+            continue
+
+        delta  = (exit_p - entry) / entry * (1 if direction == "LONG" else -1)
+        profit = round(max(stake * mult * delta, -stake), 2)
+        sl_d   = abs(entry - sl)
+        r      = ((exit_p - entry) / sl_d if direction == "LONG" else (entry - exit_p) / sl_d)
+        return {"profit": profit, "r": round(r, 2), "candles": i+1,
+                "reason": "tp" if exit_p == tp else "sl"}
+
+    # Timeout
+    ep     = candles_after[min(max_c-1, len(candles_after)-1)]["close"]
+    delta  = (ep - entry) / entry * (1 if direction == "LONG" else -1)
+    profit = round(max(stake * mult * delta, -stake), 2)
+    sl_d   = abs(entry - sl)
+    r      = (ep - entry) / sl_d if direction == "LONG" else (entry - ep) / sl_d
+    return {"profit": profit, "r": round(r, 2), "candles": max_c, "reason": "timeout"}
+
+# ─────────────────────────────────────────────
+# ESTRATEGIA A — BOLLINGER MEAN REVERSION M15
+# ─────────────────────────────────────────────
+def strat_bollinger(candles):
+    """
+    BB (20, 2std) + RSI confirma extremo.
+    TP = banda media | SL = 0.5 ATR más allá de la banda.
+    Basado en el comportamiento de mean reversion del EUR/USD.
+    """
+    if len(candles) < 30: return None
+
     closes = [c["close"] for c in candles]
-    rsi    = calc_rsi(closes)
-    avg_b  = avg_body(candles)
     ultima = candles[-1]
-    previa = candles[-2]
+    curr   = ultima["close"]
+    rsi    = calc_rsi(closes)
+    atr    = calc_atr(candles)
+    if rsi is None or atr is None: return None
 
-    swing_highs, swing_lows = [], []
-    for i in range(2, len(candles) - 2):
-        c = candles[i]
-        if (c["high"] > candles[i-1]["high"] and c["high"] > candles[i-2]["high"] and
-                c["high"] > candles[i+1]["high"] and c["high"] > candles[i+2]["high"]):
-            swing_highs.append(c["high"])
-        if (c["low"] < candles[i-1]["low"] and c["low"] < candles[i-2]["low"] and
-                c["low"] < candles[i+1]["low"] and c["low"] < candles[i+2]["low"]):
-            swing_lows.append(c["low"])
+    bb_l, bb_m, bb_h = calc_bollinger(closes, 20, 2.0)
+    if bb_l is None: return None
 
-    if len(swing_highs) < 2 or len(swing_lows) < 2: return None
-    last_sh = swing_highs[-1]
-    last_sl = swing_lows[-1]
-    curr    = ultima["close"]
-    rango   = last_sh - last_sl
+    # Anti-spike
+    ab = avg_body(candles[:-1], 20)
+    if ab > 0 and abs(ultima["close"] - ultima["open"]) > ab * 2.5:
+        return None
 
-    if rango < atr * 1.5 or rango <= 0: return None
+    # LONG — toca banda inferior, RSI sobrevendido
+    if curr <= bb_l and rsi < 35:
+        sl = round(bb_l - atr * 0.5, 5)
+        tp = round(bb_m, 5)
+        rr = (tp - curr) / (curr - sl) if curr > sl else 0
+        if rr < 1.0: return None
+        return {"direction": "LONG", "entry": curr, "sl_price": sl, "tp_price": tp,
+                "detail": f"BB inferior | RSI {round(rsi,1)} | RR {round(rr,2)}:1"}
 
-    body_ok      = abs(ultima["close"] - ultima["open"]) > avg_b * 1.2 if avg_b > 0 else True
-    trigger_bear = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"] and body_ok
-    trigger_bull = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"] and body_ok
-
-    ema200v = calc_ema(closes, 200)
-    ema200  = ema200v[-1] if len(ema200v) >= 200 else None
-
-    if ema200 is None or curr < ema200:
-        f618 = last_sh - rango * 0.382
-        f786 = last_sh - rango * 0.214
-        if f618 <= curr <= f786 and trigger_bear and (rsi is None or rsi > 55):
-            return {"direction": "SHORT", "entry": curr, "sl_price": last_sh + atr * sl_atr_mult}
-
-    if ema200 is None or curr > ema200:
-        f618 = last_sl + rango * 0.382
-        f786 = last_sl + rango * 0.214
-        if f786 <= curr <= f618 and trigger_bull and (rsi is None or rsi < 45):
-            return {"direction": "LONG", "entry": curr, "sl_price": last_sl - atr * sl_atr_mult}
+    # SHORT — toca banda superior, RSI sobrecomprado
+    if curr >= bb_h and rsi > 65:
+        sl = round(bb_h + atr * 0.5, 5)
+        tp = round(bb_m, 5)
+        rr = (curr - tp) / (sl - curr) if sl > curr else 0
+        if rr < 1.0: return None
+        return {"direction": "SHORT", "entry": curr, "sl_price": sl, "tp_price": tp,
+                "detail": f"BB superior | RSI {round(rsi,1)} | RR {round(rr,2)}:1"}
 
     return None
 
 # ─────────────────────────────────────────────
-# ESTRATEGIA 2 — RSI DIVERGENCIAS
-# Replica exacta del gold bot original (+48.45R)
+# ESTRATEGIA B — LONDON BREAKOUT M5
 # ─────────────────────────────────────────────
-def strat_rsi_divergence(candles, config):
-    rsi_period  = config.get("rsi_period", 14)
-    imp_candles = config.get("impulse_candles", 4)
-    spike_mult  = config.get("spike_mult", 3.0)
-    spike_lb    = config.get("spike_lookback", 20)
-    max_pts     = config.get("max_points", 20)
+def strat_london_breakout(candles_m5, idx):
+    """
+    Rango de Asia (00:00-08:00 UTC) → breakout en apertura Londres.
+    Solo en ventana 08:00-08:45 UTC. Máximo 1 trade por día.
+    TP = 1.5x rango Asia | SL = 0.25x rango (RR ~4:1)
+    """
+    ultima = candles_m5[idx]
+    dt     = datetime.fromtimestamp(ultima["epoch"], tz=timezone.utc)
 
-    if len(candles) < rsi_period + imp_candles + max_pts + 10: return None
+    # Solo en ventana de apertura Londres
+    if not (dt.hour == 8 and dt.minute < 45):
+        return None
 
-    closes = [c["close"] for c in candles]
-    lows   = [c["low"]   for c in candles]
-    highs  = [c["high"]  for c in candles]
-    ultima = candles[-1]
+    # Calcular rango Asia del mismo día
+    day_ts    = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    london_ts = dt.replace(hour=8, minute=0, second=0, microsecond=0).timestamp()
 
-    # Filtro anti-spike en vela actual
-    if len(candles) >= spike_lb:
-        ab   = avg_body(candles[-(spike_lb+1):-1], spike_lb)
-        body = abs(ultima["close"] - ultima["open"])
-        if ab > 0 and body > ab * spike_mult:
-            return None
+    asia = [c for c in candles_m5[:idx]
+            if day_ts <= c["epoch"] < london_ts]
 
-    # RSI para cada vela (ventana deslizante)
-    rsi_vals = [None] * len(candles)
-    for i in range(rsi_period, len(candles)):
-        rsi_vals[i] = calc_rsi(closes[max(0, i - rsi_period * 2):i + 1], rsi_period)
+    if len(asia) < 20: return None  # necesitamos rango Asia completo
 
-    n = len(candles)
+    asia_high  = max(c["high"] for c in asia)
+    asia_low   = min(c["low"]  for c in asia)
+    asia_range = asia_high - asia_low
 
-    # ── BULLISH: 4+ velas bajistas → P1 mínimo → P2 mínimo menor con RSI mayor ──
+    # Filtro de rango: ni muy chico (sin volatilidad) ni muy grande (noticias)
+    atr = calc_atr(candles_m5[:idx])
+    if not atr: return None
+    if asia_range < atr * 0.4: return None   # rango muy chico → sin setup
+    if asia_range > atr * 4.0: return None   # rango enorme → evitar día de noticias
+
+    curr   = ultima["close"]
+    buffer = asia_range * 0.08  # confirmación de breakout
+
+    # Breakout alcista
+    if curr > asia_high + buffer:
+        sl = round(asia_high - buffer, 5)
+        tp = round(curr + asia_range * 1.5, 5)
+        return {"direction": "LONG", "entry": curr, "sl_price": sl, "tp_price": tp,
+                "detail": f"Breakout London alcista | Asia range: {round(asia_range*10000,1)}p"}
+
+    # Breakout bajista
+    if curr < asia_low - buffer:
+        sl = round(asia_low + buffer, 5)
+        tp = round(curr - asia_range * 1.5, 5)
+        return {"direction": "SHORT", "entry": curr, "sl_price": sl, "tp_price": tp,
+                "detail": f"Breakout London bajista | Asia range: {round(asia_range*10000,1)}p"}
+
+    return None
+
+# ─────────────────────────────────────────────
+# ESTRATEGIA C — RSI DIVERGENCIAS H1 + TP FIJO
+# ─────────────────────────────────────────────
+def strat_rsi_div_h1(candles_h1):
+    """
+    Misma lógica del gold bot pero en H1.
+    En M15 el ruido del EUR/USD mata las señales antes del move.
+    H1 filtra ese ruido — la estructura técnica se respeta mejor.
+    TP fijo 2R (sin trailing — moves de H1 son más completos).
+    Sesión: overlap Londres-NY (10:00-14:00 UTC).
+    """
+    rsi_period  = 14
+    imp_candles = 3   # H1: basta con 3 velas impulso
+    max_pts     = 12  # máximo 12 horas entre P1 y P2
+
+    if len(candles_h1) < rsi_period + imp_candles + max_pts + 5: return None
+
+    closes = [c["close"] for c in candles_h1]
+    lows   = [c["low"]   for c in candles_h1]
+    highs  = [c["high"]  for c in candles_h1]
+    ultima = candles_h1[-1]
+
+    # Anti-spike H1
+    ab   = avg_body(candles_h1[-21:-1], 20)
+    body = abs(ultima["close"] - ultima["open"])
+    if ab > 0 and body > ab * 2.5: return None
+
+    # RSI deslizante
+    rsi_vals = [None] * len(candles_h1)
+    for i in range(rsi_period, len(candles_h1)):
+        rsi_vals[i] = calc_rsi(closes[max(0, i-rsi_period*2):i+1], rsi_period)
+
+    atr = calc_atr(candles_h1)
+    if not atr: return None
+
+    n = len(candles_h1)
+
+    # BULLISH: 3+ velas bajistas H1 → P1 mínimo → P2 mínimo menor con RSI mayor
     for p1 in range(n - max_pts - 2, n - 3):
         if p1 < imp_candles + rsi_period: continue
-        if not all(candles[p1-k-1]["close"] < candles[p1-k-1]["open"] for k in range(imp_candles)):
-            continue
-        p1_low = lows[p1]
+        if not all(candles_h1[p1-k-1]["close"] < candles_h1[p1-k-1]["open"]
+                   for k in range(imp_candles)): continue
         p1_rsi = rsi_vals[p1]
         if p1_rsi is None: continue
 
         for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
             between = [r for r in rsi_vals[p1+1:p2] if r is not None]
-            if any(r >= 50 for r in between): break  # reset RSI — invalida señal
-
-            p2_low = lows[p2]
+            if any(r >= 50 for r in between): break
             p2_rsi = rsi_vals[p2]
             if p2_rsi is None: continue
-
-            if p2_low < p1_low and p2_rsi > p1_rsi and p2 == n - 2:
-                atr = calc_atr(candles[:p2+1])
-                if not atr: continue
+            if lows[p2] < lows[p1] and p2_rsi > p1_rsi and p2 == n - 2:
+                sl   = round(lows[p2] - atr * 0.3, 5)
+                dist = abs(ultima["close"] - sl)
+                tp   = round(ultima["close"] + dist * 2.0, 5)
                 return {
-                    "direction": "LONG",
-                    "entry":     ultima["close"],
-                    "sl_price":  p2_low - atr * 0.3,
+                    "direction": "LONG", "entry": ultima["close"],
+                    "sl_price": sl, "tp_price": tp,
+                    "detail": f"RSI Div Bull H1 | P1:{round(p1_rsi,1)} → P2:{round(p2_rsi,1)}"
                 }
 
-    # ── BEARISH: 4+ velas alcistas → P1 máximo → P2 máximo mayor con RSI menor ──
+    # BEARISH
     for p1 in range(n - max_pts - 2, n - 3):
         if p1 < imp_candles + rsi_period: continue
-        if not all(candles[p1-k-1]["close"] > candles[p1-k-1]["open"] for k in range(imp_candles)):
-            continue
-        p1_high = highs[p1]
-        p1_rsi  = rsi_vals[p1]
+        if not all(candles_h1[p1-k-1]["close"] > candles_h1[p1-k-1]["open"]
+                   for k in range(imp_candles)): continue
+        p1_rsi = rsi_vals[p1]
         if p1_rsi is None: continue
 
         for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
             between = [r for r in rsi_vals[p1+1:p2] if r is not None]
             if any(r <= 50 for r in between): break
-
-            p2_high = highs[p2]
-            p2_rsi  = rsi_vals[p2]
+            p2_rsi = rsi_vals[p2]
             if p2_rsi is None: continue
-
-            if p2_high > p1_high and p2_rsi < p1_rsi and p2 == n - 2:
-                atr = calc_atr(candles[:p2+1])
-                if not atr: continue
+            if highs[p2] > highs[p1] and p2_rsi < p1_rsi and p2 == n - 2:
+                sl   = round(highs[p2] + atr * 0.3, 5)
+                dist = abs(sl - ultima["close"])
+                tp   = round(ultima["close"] - dist * 2.0, 5)
                 return {
-                    "direction": "SHORT",
-                    "entry":     ultima["close"],
-                    "sl_price":  p2_high + atr * 0.3,
+                    "direction": "SHORT", "entry": ultima["close"],
+                    "sl_price": sl, "tp_price": tp,
+                    "detail": f"RSI Div Bear H1 | P1:{round(p1_rsi,1)} → P2:{round(p2_rsi,1)}"
                 }
 
     return None
 
 # ─────────────────────────────────────────────
-# SIMULACION TRAILING 3 ETAPAS
+# BACKTEST GENÉRICO
 # ─────────────────────────────────────────────
-def simulate_trade(candles_after, direction, entry, sl_price, stake, multiplier):
-    """
-    Trailing optimizado — 4 etapas para capturar más en winners:
-      Etapa 0 (<1R):  SL fijo — dejar respirar
-      Etapa 1 (>=1R): Break-even + buffer 0.3 ATR — protege sin cortar
-      Etapa 2 (>=2R): ATR 1.5x desde entry — da espacio en moves medianos
-      Etapa 3 (>=3R): Low/High vela anterior — trailing activo
-      Etapa 4 (>=5R): Body vela anterior — máxima captura en moves grandes
-    """
-    sl_dist = abs(entry - sl_price)
-    if sl_dist == 0:
-        return {"profit": 0, "r": 0, "candles": 0, "reason": "invalid_sl"}
-
-    # ATR estimado como el SL distance (proxy razonable)
-    atr_est    = sl_dist / 0.3  # el SL se puso a 0.3 ATR del swing
-    current_sl = sl_price
-    stage      = 0
-
-    for i, c in enumerate(candles_after[:200]):
-        hit = c["low"] <= current_sl if direction == "LONG" else c["high"] >= current_sl
-        if hit:
-            delta  = (current_sl - entry) / entry * (1 if direction == "LONG" else -1)
-            profit = round(max(stake * multiplier * delta, -stake), 2)
-            r      = (current_sl - entry) / sl_dist if direction == "LONG" else (entry - current_sl) / sl_dist
-            return {"profit": profit, "r": round(r, 2), "candles": i+1, "reason": "sl_hit"}
-
-        pts   = (c["close"] - entry) if direction == "LONG" else (entry - c["close"])
-        r_now = pts / sl_dist
-        new_s = 4 if r_now >= 5 else (3 if r_now >= 3 else (2 if r_now >= 2 else (1 if r_now >= 1 else 0)))
-        if new_s > stage: stage = new_s
-
-        if stage == 1:
-            # Break-even + pequeño buffer para no salir en el ruido
-            be = entry + atr_est * 0.3 if direction == "LONG" else entry - atr_est * 0.3
-            if direction == "LONG"  and be > current_sl: current_sl = be
-            if direction == "SHORT" and be < current_sl: current_sl = be
-
-        elif stage == 2:
-            # ATR 1.5x desde entry — da espacio sin cortar el trade
-            trail = entry + atr_est * 1.5 if direction == "LONG" else entry - atr_est * 1.5
-            if direction == "LONG"  and trail > current_sl: current_sl = trail
-            if direction == "SHORT" and trail < current_sl: current_sl = trail
-
-        elif stage == 3 and i >= 1:
-            # Low/High de vela anterior — trailing activo
-            prev = candles_after[i-1]
-            if direction == "LONG"  and prev["low"]  > current_sl: current_sl = prev["low"]
-            if direction == "SHORT" and prev["high"] < current_sl: current_sl = prev["high"]
-
-        elif stage == 4 and i >= 1:
-            # Body de vela anterior — máxima captura
-            prev  = candles_after[i-1]
-            body_sl = min(prev["open"], prev["close"]) if direction == "LONG" else max(prev["open"], prev["close"])
-            if direction == "LONG"  and body_sl > current_sl: current_sl = body_sl
-            if direction == "SHORT" and body_sl < current_sl: current_sl = body_sl
-
-    ep     = candles_after[min(199, len(candles_after)-1)]["close"]
-    delta  = (ep - entry) / entry * (1 if direction == "LONG" else -1)
-    profit = round(max(stake * multiplier * delta, -stake), 2)
-    r_f    = (ep - entry) / sl_dist if direction == "LONG" else (entry - ep) / sl_dist
-    return {"profit": profit, "r": round(r_f, 2), "candles": 200, "reason": "timeout"}
-
-# ─────────────────────────────────────────────
-# BACKTEST
-# ─────────────────────────────────────────────
-async def backtest_asset(key, config, candles):
+async def backtest(name, candles, signal_fn, session, cooldown_mult=3):
     trades, cooldown_end = [], 0
-    warmup = max(250, config.get("rsi_period", 14) * 3 + 30)
+    gran = candles[1]["epoch"] - candles[0]["epoch"] if len(candles) > 1 else 900
+    warmup = 280
 
     for i in range(warmup, len(candles) - 1):
         epoch = candles[i]["epoch"]
-        if not in_session(epoch, config["session"]): continue
+        if not in_session(epoch, session[0], session[1]): continue
         if epoch < cooldown_end: continue
 
         window = candles[:i+1]
-        signal = (strat_smc(window, config.get("sl_atr_mult", 0.5))
-                  if config["strategy"] == "smc"
-                  else strat_rsi_divergence(window, config))
+
+        # London Breakout necesita acceso al array completo e índice
+        if name == "London Breakout M5":
+            signal = signal_fn(candles, i)
+        else:
+            signal = signal_fn(window)
 
         if not signal: continue
 
-        result = simulate_trade(
-            candles[i+1:], signal["direction"], signal["entry"],
-            signal["sl_price"], config["stake"], config["multiplier"]
+        result = simulate_fixed_tp(
+            candles[i+1:], signal["direction"],
+            signal["entry"], signal["sl_price"], signal["tp_price"],
+            STAKE, MULTIPLIER
         )
+
         dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
         trades.append({
             "date": dt.strftime("%Y-%m-%d %H:%M"),
@@ -406,152 +409,163 @@ async def backtest_asset(key, config, candles):
             "profit": result["profit"],
             "r": result["r"],
             "reason": result["reason"],
+            "detail": signal.get("detail", ""),
         })
-        cooldown_end = epoch + config["granularity"] * 3
-        print(f"  {'✅' if result['profit'] > 0 else '❌'} {dt.strftime('%m-%d %H:%M')} | {signal['direction']} | ${result['profit']} | {result['r']}R")
+        cooldown_end = epoch + gran * cooldown_mult
+
+        icon = "✅" if result["profit"] > 0 else "❌"
+        print(f"  {icon} {dt.strftime('%m-%d %H:%M')} | {signal['direction']} | "
+              f"${result['profit']} | {result['r']}R | {result['reason']}")
 
     return trades
 
 # ─────────────────────────────────────────────
-# ANALISIS
+# ANÁLISIS
 # ─────────────────────────────────────────────
-def analyze(key, config, trades):
+def analyze(name, trades):
     if not trades: return None
     wins   = [t for t in trades if t["profit"] > 0]
     losses = [t for t in trades if t["profit"] <= 0]
     total  = len(trades)
-    wr     = round(len(wins) / total * 100, 1)
+    wr     = round(len(wins)/total*100, 1)
     profit = round(sum(t["profit"] for t in trades), 2)
     avg_w  = round(np.mean([t["profit"] for t in wins]),   2) if wins   else 0
     avg_l  = round(np.mean([t["profit"] for t in losses]), 2) if losses else 0
-    exp    = round(wr/100 * avg_w + (1-wr/100) * avg_l, 2)
+    exp    = round(wr/100*avg_w + (1-wr/100)*avg_l, 2)
     gw     = sum(t["profit"] for t in wins)
     gl     = abs(sum(t["profit"] for t in losses))
-    pf     = round(gw / gl, 2) if gl > 0 else float("inf")
+    pf     = round(gw/gl, 2) if gl > 0 else float("inf")
     cum    = np.cumsum([t["profit"] for t in trades])
     max_dd = round(float(np.min(cum - np.maximum.accumulate(cum))), 2)
+    tp_pct = round(len([t for t in trades if t["reason"] == "tp"])/total*100, 1)
     avg_r  = round(np.mean([t["r"] for t in trades]), 2)
     best   = max(trades, key=lambda t: t["profit"])
     worst  = min(trades, key=lambda t: t["profit"])
-    sw = sl = mw = ml = 0
+    sw = sl_s = mw = ml = 0
     for t in trades:
-        if t["profit"] > 0: sw += 1; sl = 0; mw = max(mw, sw)
-        else: sl += 1; sw = 0; ml = max(ml, sl)
+        if t["profit"] > 0: sw += 1; sl_s = 0; mw = max(mw, sw)
+        else: sl_s += 1; sw = 0; ml = max(ml, sl_s)
     return {
-        "key": key, "name": config["name"], "strat": config["strategy"],
-        "total": total, "wins": len(wins), "losses": len(losses),
+        "name": name, "total": total, "wins": len(wins), "losses": len(losses),
         "wr": wr, "profit": profit, "avg_win": avg_w, "avg_loss": avg_l,
         "expectancy": exp, "max_dd": max_dd, "pf": pf, "avg_r": avg_r,
-        "best": best, "worst": worst, "streak_win": mw, "streak_loss": ml,
+        "tp_pct": tp_pct, "best": best, "worst": worst,
+        "streak_win": mw, "streak_loss": ml,
     }
 
 def verdict(s):
-    if s["wr"] >= 50 and s["expectancy"] > 0 and s["pf"] >= 1.3 and s["total"] >= 15:
+    if s["wr"] >= 50 and s["expectancy"] > 0 and s["pf"] >= 1.3 and s["total"] >= 20:
         return "✅ EDGE REAL"
     if s["expectancy"] > 0 and s["pf"] >= 1.1:
         return "🟡 EDGE MARGINAL"
     return "❌ SIN EDGE"
 
 # ─────────────────────────────────────────────
-# REPORTE TELEGRAM
+# REPORTE
 # ─────────────────────────────────────────────
 async def send_report(all_stats, months):
     now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     await send_telegram(
-        f"📊 *BACKTEST v2 — {now}*\n"
-        f"Periodo: *{months} meses* | Trailing: BE@1R → Vela@2R → Agresivo@3R\n"
+        f"📊 *EUR/USD BACKTEST — {now}*\n"
+        f"Periodo: *{months} meses* | TP fijo | Sin trailing\n"
         f"══════════════════════════"
     )
     await asyncio.sleep(1)
 
-    # Comparativo Gold
-    gold = [s for s in all_stats if s and "Gold" in s["name"]]
-    if len(gold) == 2:
-        smc    = next(s for s in gold if "SMC" in s["name"])
-        rsi    = next(s for s in gold if "RSI" in s["name"])
-        winner = smc if (smc["pf"] if smc["pf"] != float("inf") else 0) >= (rsi["pf"] if rsi["pf"] != float("inf") else 0) else rsi
-        rec    = "Mantener SMC v9" if winner == smc else "Volver a RSI Divergencias"
-        await send_telegram(
-            f"⚔️ *GOLD — SMC v9 vs RSI Divergencias*\n"
-            f"──────────────────────\n"
-            f"SMC v9:  {smc['total']} trades | WR {smc['wr']}% | PF {smc['pf']}x | ${smc['profit']}\n"
-            f"RSI Div: {rsi['total']} trades | WR {rsi['wr']}% | PF {rsi['pf']}x | ${rsi['profit']}\n"
-            f"──────────────────────\n"
-            f"🏆 *Ganador: {winner['name']}*\n_{rec}_"
-        )
-        await asyncio.sleep(1)
-
-    # Individual
+    winner = None
     for s in all_stats:
         if not s: continue
+        v = verdict(s)
+        if s["total"] >= 15 and (winner is None or s["pf"] > winner["pf"]):
+            winner = s
         await send_telegram(
             f"*{s['name']}*\n"
             f"──────────────────────\n"
-            f"Trades: *{s['total']}* | WR: *{s['wr']}%*\n"
+            f"Trades: *{s['total']}* | WR: *{s['wr']}%* | TP hit: {s['tp_pct']}%\n"
             f"P&L: *${s['profit']}* | Expectancy: ${s['expectancy']}/trade\n"
             f"Profit Factor: *{s['pf']}x* | R prom: {s['avg_r']}R\n"
             f"Avg Win: ${s['avg_win']} | Avg Loss: ${s['avg_loss']}\n"
             f"Max DD: ${s['max_dd']} | Rachas: {s['streak_win']}W/{s['streak_loss']}L\n"
             f"Mejor: ${s['best']['profit']} ({s['best']['date']})\n"
-            f"Peor:  ${s['worst']['profit']} ({s['worst']['date']})\n"
+            f"Peor: ${s['worst']['profit']} ({s['worst']['date']})\n"
             f"──────────────────────\n"
-            f"{verdict(s)}"
+            f"{v}"
         )
         await asyncio.sleep(1)
 
-    # Recomendacion scanner
-    scanner = [s for s in all_stats if s and "Gold" not in s["name"]]
-    if scanner:
-        viable  = [s for s in scanner if verdict(s) != "❌ SIN EDGE"]
-        no_edge = [s for s in scanner if verdict(s) == "❌ SIN EDGE"]
-        lines   = [f"  ✅ {s['name']} (PF {s['pf']}x, WR {s['wr']}%)" for s in viable]
-        lines  += [f"  ❌ Descartar: {s['name']}" for s in no_edge]
+    if winner:
+        v = verdict(winner)
+        conclusion = (
+            f"✅ Agregar al scanner con estrategia _{winner['name']}_"
+            if v != "❌ SIN EDGE"
+            else "❌ Ninguna estrategia tiene edge suficiente — EUR/USD queda fuera del scanner"
+        )
         await send_telegram(
-            f"*RECOMENDACION SCANNER*\n"
+            f"*VEREDICTO EUR/USD*\n"
             f"══════════════════════════\n"
-            + ("\n".join(lines) if lines else "_Sin datos suficientes_") +
-            f"\n══════════════════════════\n"
-            f"_Activar solo activos con edge confirmado_"
+            f"Mejor estrategia: *{winner['name']}*\n"
+            f"PF {winner['pf']}x | WR {winner['wr']}% | ${winner['profit']} en {months}m\n"
+            f"──────────────────────\n"
+            f"{conclusion}"
         )
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-async def main(months: int = 3):
-    print(f"\n{'='*50}")
-    print(f"  BACKTEST v2 — {months} meses")
-    print(f"{'='*50}\n")
+async def main(months=6):
+    print(f"\n{'='*55}")
+    print(f"  EUR/USD BACKTEST — {months} meses")
+    print(f"  Estrategias: Bollinger MR | London Breakout | RSI Div H1")
+    print(f"{'='*55}\n")
 
     await send_telegram(
-        f"⏳ *Backtest v2 iniciando...*\n"
-        f"Gold SMC vs RSI Div + Scanner 4 activos\n"
-        f"Periodo: {months} meses | _descargando datos..._"
+        f"⏳ *EUR/USD — Buscando edge...*\n"
+        f"A) Bollinger Mean Reversion M15\n"
+        f"B) London Breakout M5\n"
+        f"C) RSI Divergencias H1 + TP fijo\n"
+        f"Periodo: *{months} meses* | _descargando..._"
     )
 
-    # Descargar por simbolo (evitar duplicados)
-    candle_cache = {}
-    for key, cfg in ASSETS.items():
-        sym = cfg["symbol"]
-        if sym not in candle_cache:
-            candle_cache[sym] = await fetch_candles(sym, cfg["granularity"], months)
+    # Descargar los 3 timeframes
+    print("Descargando M15...")
+    c_m15 = await fetch_candles(900, months)
+    print("Descargando M5...")
+    c_m5  = await fetch_candles(300, months)
+    print("Descargando H1...")
+    c_h1  = await fetch_candles(3600, months)
 
-    # Correr backtests
-    all_stats = []
-    for key, cfg in ASSETS.items():
-        print(f"\n--- {cfg['name']} ({cfg['strategy']}) ---")
-        trades = await backtest_asset(key, cfg, candle_cache[cfg["symbol"]])
-        stats  = analyze(key, cfg, trades)
-        all_stats.append(stats)
-        if stats:
-            print(f"  -> WR:{stats['wr']}% | P&L:${stats['profit']} | PF:{stats['pf']}x | Trades:{stats['total']}")
+    results = []
+
+    # A) Bollinger Mean Reversion M15 — sesión Londres
+    print("─── A) Bollinger Mean Reversion M15 ───")
+    t_a = await backtest("Bollinger MR M15", c_m15, strat_bollinger, (8, 12))
+    results.append(analyze("A) Bollinger Mean Rev M15", t_a))
+
+    # B) London Breakout M5
+    print("\n─── B) London Breakout M5 ───")
+    t_b = await backtest("London Breakout M5", c_m5, strat_london_breakout, (8, 9), cooldown_mult=6)
+    results.append(analyze("B) London Breakout M5", t_b))
+
+    # C) RSI Divergencias H1 — overlap Londres-NY
+    print("\n─── C) RSI Divergencias H1 ───")
+    t_c = await backtest("RSI Div H1", c_h1, strat_rsi_div_h1, (10, 14))
+    results.append(analyze("C) RSI Div H1 TP fijo", t_c))
+
+    # Mostrar resumen en consola
+    print(f"\n{'='*55}")
+    print("  RESUMEN FINAL")
+    print(f"{'='*55}")
+    for s in results:
+        if s:
+            print(f"  {s['name']}: {s['total']} trades | WR {s['wr']}% | PF {s['pf']}x | ${s['profit']} | {verdict(s)}")
         else:
-            print(f"  -> Sin trades generados")
+            print(f"  Sin trades generados")
 
-    await send_report(all_stats, months)
-    print("\nBacktest completado.\n")
+    await send_report(results, months)
+    print("\nBacktest EUR/USD completado.\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--months", type=int, default=3)
+    parser.add_argument("--months", type=int, default=6)
     args = parser.parse_args()
     asyncio.run(main(args.months))
