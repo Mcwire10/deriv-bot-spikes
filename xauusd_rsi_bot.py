@@ -1,976 +1,527 @@
 """
-Signal Scanner v8 — Smart Money + Production Ready
-====================================================
-Del v7: SMC strategy (MSS + Fibonacci zones), Risk Engine (multiplier dinamico),
-        H1 Inertia Filter (EMA 200), Correlation Shield, 3 activos fuertes.
-Del v5: Trailing 3 etapas (break-even → trailing → agresivo), WS secundario
-        para portfolio, suscripcion por contrato, open_trade real, fix Cloudflare.
+BOT XAU/USD (ORO) - SMC QUANT EDITION v9.1
+=========================================================
+Fix v9.1: Ping keepalive para evitar desconexiones por inactividad.
 """
 
 import asyncio
 import json
 import websockets
+import os
+import aiohttp
 import numpy as np
 from datetime import datetime, timezone
-from collections import defaultdict
-import os
+from collections import deque
 import shared
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-DERIV_APP_ID       = "1089"
-DERIV_WS_URL       = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-DERIV_API_TOKEN    = os.environ.get("DERIV_API_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+# ══════════════════════════════════════════
+#  CONFIGURACIÓN Y CREDENCIALES
+# ══════════════════════════════════════════
+API_TOKEN        = os.environ.get("DERIV_API_TOKEN")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-MAX_OPEN_CONTRACTS = 3
+SYMBOL           = "frxXAUUSD"
+STAKE_MINIMO     = 2.00    
+RIESGO_PCT       = 0.01
+MULTIPLIER       = 100
+ANTI_SPIKE_MULT  = 3
+GRANULARITY      = 900
+CANDLES_COUNT    = 250
 
-# Correlacion Forex — evita sobreexposicion a la misma moneda
-FOREX_EXPOSURE = {
-    "frxEURUSD": ["USD", "EUR"],
-    "frxGBPJPY": ["GBP", "JPY"],
-    "OTC_SPC":   [],   # indice — no correlaciona con forex
+SESIONES = {
+    "asia":    {"start": 0,  "end": 3,  "trailing": False, "tp_ratio": 1.0},
+    "londres": {"start": 3,  "end": 8,  "trailing": True,  "tp_ratio": None},
+    "ny":      {"start": 13, "end": 20, "trailing": True,  "tp_ratio": None},
 }
 
-# ─────────────────────────────────────────────
-# ASSETS — validados por backtesting 12 meses
-# GBP/USD: PF 1.71x WR 51% | GBP/JPY: PF 1.93x | Silver: PF 1.89x
-# EUR/USD y US500 descartados (sin edge confirmado)
-# ─────────────────────────────────────────────
-ASSETS = {
-    "frxGBPUSD": {
-        "name": "GBP/USD", "symbol": "frxGBPUSD", "granularity": 900,
-        "strategy": "rsi_divergence", "session": "london_open",
-        "trailing_mode": "optimized", "trailing_after_r": 0.0,
-        "first_signal_only": True, "confidence": 85,
-        "use_h1_inertia": False,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxGBPJPY": {
-        "name": "GBP/JPY", "symbol": "frxGBPJPY", "granularity": 1800,
-        "strategy": "rsi_divergence", "session": "asia_london",
-        "trailing_mode": "optimized", "trailing_after_r": 0.0,
-        "first_signal_only": True, "confidence": 80,
-        "use_h1_inertia": False,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-    "frxXAGUSD": {
-        "name": "Silver XAG/USD", "symbol": "frxXAGUSD", "granularity": 900,
-        "strategy": "rsi_divergence", "session": "ny_open",
-        "trailing_mode": "optimized", "trailing_after_r": 0.0,
-        "first_signal_only": True, "confidence": 85,
-        "use_h1_inertia": False,
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
-    },
-}
+SALDO_MINIMO     = 5.00
+# META_DIARIA y STOP_LOSS_DIARIO vienen de shared.py (env vars)
 
-SESSIONS = {
-    "london_open":  (8,  12),
-    "asia_london":  (6,  9),
-    "ny_open":      (13, 17),
-    "wallstreet":   (16, 21),
-    "all":          (0,  24),
-}
+TZ_UTC = timezone.utc
+WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
-# ─────────────────────────────────────────────
-# ESTADO GLOBAL
-# ─────────────────────────────────────────────
-candle_store     = defaultdict(list)   # M granularity por activo
-h1_store         = defaultdict(list)   # H1 para inertia filter
-signal_emitted   = defaultdict(lambda: None)
-signal_cooldown  = {}   # { symbol: last_signal_epoch } — evita spam entre velas
-assets_blocked   = set()  # activos no disponibles — skip hasta reinicio
-active_contracts: dict = {}
-account_currency = "eUSDT"
-account_balance  = 0.0
+# ══════════════════════════════════════════
+#  ESTADO GLOBAL
+# ══════════════════════════════════════════
+balance_actual       = None
+moneda               = "USD"
+profit_dia           = 0.0
+trades_ganados       = 0
+trades_perdidos      = 0
+bot_pausado          = False
+fecha_actual         = datetime.now(TZ_UTC).date()
+contratos_vistos     = set()
+trade_abierto        = False
+contrato_abierto_id  = None
+trailing_sl_actual   = None
+direction_actual     = None
+ultimo_ctx           = {}
 
-# ─────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────
-async def send_telegram(message: str):
-    import aiohttp
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+velas                = []
+vela_procesada_epoch = None
+
+
+async def enviar_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            })
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
     except Exception as e:
-        print(f"[Telegram error] {e}")
+        print(f"🚨 Telegram error: {e}")
 
-# ─────────────────────────────────────────────
-# KEEPALIVE — evita desconexiones por inactividad
-# ─────────────────────────────────────────────
+
+def reset_diario():
+    shared.reset_diario_si_corresponde()
+    contratos_vistos.clear()
+
+
+def sesion_activa():
+    hora = datetime.now(TZ_UTC).hour
+    for nombre, s in SESIONES.items():
+        if s["start"] <= hora < s["end"]:
+            return nombre
+    return None
+
+
+# ══════════════════════════════════════════
+#  KEEPALIVE — FIX DESCONEXIONES
+# ══════════════════════════════════════════
 async def keepalive(ws):
-    """Ping cada 20s para mantener el WS vivo. Deriv responde con pong."""
+    """
+    Manda un ping a Deriv cada 30s para mantener el WebSocket vivo.
+    Deriv responde con {ping: "pong"} — lo ignoramos.
+    Sin esto, Cloudflare cierra la conexion por inactividad.
+    """
     while True:
         try:
             await asyncio.sleep(20)
             await ws.send(json.dumps({"ping": 1}))
         except Exception:
-            break  # WS cerrado — task termina sola
+            break  # Si el WS se cerro, la task termina sola
 
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
-def in_session(name: str) -> bool:
-    h = datetime.now(timezone.utc).hour
-    s, e = SESSIONS.get(name, (0, 24))
-    return s <= h < e
 
-def session_key(symbol: str) -> str:
-    now = datetime.now(timezone.utc)
-    return f"{symbol}-{now.strftime('%Y-%m-%d')}-{ASSETS[symbol]['session']}"
+# ══════════════════════════════════════════
+#  INDICADORES
+# ══════════════════════════════════════════
+def calcular_ema(closes, period=200):
+    if len(closes) < period: return None
+    k = 2 / (period + 1)
+    ema = closes[0]
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-def confidence_emoji(c: int) -> str:
-    if c >= 90: return "🔥"
-    if c >= 80: return "✅"
-    return "🟡"
-
-def now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-# ─────────────────────────────────────────────
-# INDICADORES
-# ─────────────────────────────────────────────
-def calc_atr(candles, period=14):
-    if len(candles) < period + 1: return None
+def calcular_atr(velas_cerradas, period=14):
+    if len(velas_cerradas) < period + 1: return 1.0
     trs = [max(c["high"]-c["low"], abs(c["high"]-p["close"]), abs(c["low"]-p["close"]))
-           for c, p in zip(candles[1:], candles)]
+           for c, p in zip(velas_cerradas[1:], velas_cerradas)]
     return float(np.mean(trs[-period:]))
 
-def calc_ema(values, period):
-    if not values: return []
-    k, out = 2 / (period + 1), []
-    for i, v in enumerate(values):
-        out.append(float(v) if i == 0 else float(v) * k + out[-1] * (1 - k))
-    return out
+def es_vela_normal(vela, velas_cerradas):
+    if len(velas_cerradas) < 20: return True
+    cuerpos  = [abs(v["close"] - v["open"]) for v in velas_cerradas[-20:]]
+    promedio = sum(cuerpos) / len(cuerpos)
+    if promedio == 0: return True
+    return abs(vela["close"] - vela["open"]) <= promedio * ANTI_SPIKE_MULT
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1: return None
-    d  = np.diff(closes)
-    ag = np.mean(np.where(d > 0, d, 0.0)[-period:])
-    al = np.mean(np.where(d < 0, -d, 0.0)[-period:])
-    if al == 0: return 100.0
-    return float(100 - 100 / (1 + ag / al))
 
-def avg_body(candles, period=20):
-    if len(candles) < period: return 0
-    return float(np.mean([abs(c["close"] - c["open"]) for c in candles[-period:]]))
+# ══════════════════════════════════════════
+#  ESTRATEGIA SMC
+# ══════════════════════════════════════════
+def evaluar_señal(velas_cerradas):
+    if len(velas_cerradas) < 200: return None
 
-def detect_rsi_divergence(candles, rsi_period=14, lookback=5):
-    if len(candles) < rsi_period + lookback + 2: return None
-    closes = [c["close"] for c in candles]
-    lows   = [c["low"]   for c in candles]
-    highs  = [c["high"]  for c in candles]
-    rv = [calc_rsi(closes[:len(closes)-lookback+i], rsi_period) for i in range(lookback+1)]
-    if None in rv: return None
-    if lows[-1]  < min(lows[-(lookback+1):-1])  and rv[-1] > min(rv[:-1]): return "bullish"
-    if highs[-1] > max(highs[-(lookback+1):-1]) and rv[-1] < max(rv[:-1]): return "bearish"
-    return None
+    closes       = [v["close"] for v in velas_cerradas]
+    ema_200      = calcular_ema(closes, 200)
+    atr_val      = calcular_atr(velas_cerradas, 14)
+    ultima       = velas_cerradas[-1]
+    previa       = velas_cerradas[-2]
 
-# ─────────────────────────────────────────────
-# RISK ENGINE INSTITUCIONAL (del v7)
-# Stake base por confianza + ajuste por timeframe + multiplier por volatilidad
-# ─────────────────────────────────────────────
-def get_risk_params(symbol: str, config: dict, candles: list):
-    """
-    Retorna (stake, multiplier) dinamicos.
-    Si la volatilidad es muy alta (ATR > 0.4% del precio), baja el multiplier
-    a 50x para proteger el capital.
-    """
-    conf = config.get("confidence", 0)
-    if conf < 70: return None, None
+    if ema_200 is None or not es_vela_normal(ultima, velas_cerradas[:-1]):
+        return None
 
-    # Stake base segun confianza
-    base = 2.00 if conf >= 90 else (1.00 if conf >= 80 else 0.50)
-
-    # Factor por temporalidad — M5 es mas rapido, mas R/trade
-    gran = config["granularity"]
-    t_factor = 1.2 if gran <= 300 else (0.8 if gran >= 3600 else 1.0)
-
-    # Multiplier dinamico por volatilidad
-    atr   = calc_atr(candles)
-    price = candles[-1]["close"] if candles else 1
-    vol_pct = (atr / price) * 100 if atr and price > 0 else 0
-    multiplier = 50 if vol_pct > 0.4 else 100
-
-    stake = round(base * t_factor, 2)
-    return stake, multiplier
-
-# ─────────────────────────────────────────────
-# H1 INERTIA FILTER (del v7)
-# Solo opera a favor de la tendencia macro (EMA 200 en H1)
-# ─────────────────────────────────────────────
-def check_h1_inertia(symbol: str, direction: str) -> bool:
-    candles = h1_store.get(symbol, [])
-    if len(candles) < 200:
-        return True   # sin datos suficientes — no bloquear
-    ema200 = calc_ema([c["close"] for c in candles], 200)[-1]
-    curr   = candles[-1]["close"]
-    if direction == "LONG"  and curr < ema200:
-        print(f"[inertia] {symbol} LONG bloqueado — precio {curr:.4f} < EMA200 {ema200:.4f}")
-        return False
-    if direction == "SHORT" and curr > ema200:
-        print(f"[inertia] {symbol} SHORT bloqueado — precio {curr:.4f} > EMA200 {ema200:.4f}")
-        return False
-    return True
-
-# ─────────────────────────────────────────────
-# CORRELATION SHIELD (del v7)
-# Evita abrir dos trades con la misma moneda base/quote
-# ─────────────────────────────────────────────
-def check_correlation_shield(new_symbol: str) -> bool:
-    if new_symbol not in FOREX_EXPOSURE: return True
-    new_currencies = FOREX_EXPOSURE[new_symbol]
-    if not new_currencies: return True   # indices — sin correlacion
-
-    active_currencies = []
-    for ctx in active_contracts.values():
-        sym = ctx.get("symbol", "")
-        if sym in FOREX_EXPOSURE:
-            active_currencies.extend(FOREX_EXPOSURE[sym])
-
-    overlap = [c for c in new_currencies if c in active_currencies]
-    if overlap:
-        print(f"[shield] {new_symbol} bloqueado — moneda {overlap} ya expuesta")
-        return False
-    return True
-
-# ─────────────────────────────────────────────
-# ESTRATEGIAS
-# ─────────────────────────────────────────────
-def run_strategy(symbol, config, candles):
-    s = config.get("strategy")
-    if s == "smart_money_mss":    return strat_smart_money_mss(symbol, config, candles)
-    if s == "ema_structure_trend": return strat_ema_struct(symbol, config, candles)
-    if s == "rsi_divergence":      return strat_rsi_divergence(symbol, config, candles)
-    return None
-
-def strat_rsi_divergence(symbol, config, candles):
-    """
-    RSI Divergencias — replica exacta del gold bot original (+48R backtestado).
-    Validado: GBP/USD PF 1.71x | GBP/JPY PF 1.93x | Silver PF 1.89x (12 meses)
-    """
-    rsi_period  = config.get("rsi_period", 14)
-    imp_candles = config.get("impulse_candles", 4)
-    spike_mult  = config.get("spike_mult", 3.0)
-    spike_lb    = config.get("spike_lookback", 20)
-    max_pts     = config.get("max_points", 20)
-
-    if len(candles) < rsi_period + imp_candles + max_pts + 10: return None
-
-    closes = [c["close"] for c in candles]
-    lows   = [c["low"]   for c in candles]
-    highs  = [c["high"]  for c in candles]
-    ultima = candles[-1]
-
-    # Filtro anti-spike
-    if len(candles) >= spike_lb:
-        ab   = avg_body(candles[-(spike_lb+1):-1], spike_lb)
-        body = abs(ultima["close"] - ultima["open"])
-        if ab > 0 and body > ab * spike_mult:
-            return None
-
-    # RSI deslizante
-    rsi_vals = [None] * len(candles)
-    for i in range(rsi_period, len(candles)):
-        rsi_vals[i] = calc_rsi(closes[max(0, i - rsi_period * 2):i + 1], rsi_period)
-
-    n = len(candles)
-
-    # BULLISH: 4+ velas bajistas → P1 mínimo → P2 mínimo menor con RSI mayor
-    for p1 in range(n - max_pts - 2, n - 3):
-        if p1 < imp_candles + rsi_period: continue
-        if not all(candles[p1-k-1]["close"] < candles[p1-k-1]["open"] for k in range(imp_candles)):
-            continue
-        p1_low = lows[p1]
-        p1_rsi = rsi_vals[p1]
-        if p1_rsi is None: continue
-
-        for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
-            between = [r for r in rsi_vals[p1+1:p2] if r is not None]
-            if any(r >= 50 for r in between): break
-
-            p2_low = lows[p2]
-            p2_rsi = rsi_vals[p2]
-            if p2_rsi is None: continue
-
-            if p2_low < p1_low and p2_rsi > p1_rsi and p2 == n - 2:
-                atr = calc_atr(candles[:p2+1])
-                if not atr: continue
-                return {
-                    "direction": "LONG",
-                    "strategy":  "RSI Bullish Divergence",
-                    "price":     ultima["close"],
-                    "sl_price":  round(p2_low - atr * 0.3, 5),
-                    "detail":    f"P1:{round(p1_low,4)} RSI:{round(p1_rsi,1)} → P2:{round(p2_low,4)} RSI:{round(p2_rsi,1)}",
-                    "rsi":       round(p2_rsi, 1),
-                }
-
-    # BEARISH: 4+ velas alcistas → P1 máximo → P2 máximo mayor con RSI menor
-    for p1 in range(n - max_pts - 2, n - 3):
-        if p1 < imp_candles + rsi_period: continue
-        if not all(candles[p1-k-1]["close"] > candles[p1-k-1]["open"] for k in range(imp_candles)):
-            continue
-        p1_high = highs[p1]
-        p1_rsi  = rsi_vals[p1]
-        if p1_rsi is None: continue
-
-        for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
-            between = [r for r in rsi_vals[p1+1:p2] if r is not None]
-            if any(r <= 50 for r in between): break
-
-            p2_high = highs[p2]
-            p2_rsi  = rsi_vals[p2]
-            if p2_rsi is None: continue
-
-            if p2_high > p1_high and p2_rsi < p1_rsi and p2 == n - 2:
-                atr = calc_atr(candles[:p2+1])
-                if not atr: continue
-                return {
-                    "direction": "SHORT",
-                    "strategy":  "RSI Bearish Divergence",
-                    "price":     ultima["close"],
-                    "sl_price":  round(p2_high + atr * 0.3, 5),
-                    "detail":    f"P1:{round(p1_high,4)} RSI:{round(p1_rsi,1)} → P2:{round(p2_high,4)} RSI:{round(p2_rsi,1)}",
-                    "rsi":       round(p2_rsi, 1),
-                }
-
-    return None
-
-# ── Smart Money Concepts — MSS + Fibonacci zones (del v7) ────────
-def strat_smart_money_mss(symbol, config, candles):
-    """
-    SMC mejorado v2 — mismos filtros validados en backtesting:
-    - Rango minimo 2x ATR (elimina rangos de ruido)
-    - RSI confirma zona (>60 SHORT, <40 LONG)
-    - Trigger con cuerpo fuerte (>1.5x promedio)
-    - US500: no entrar en primeros 15 min de apertura
-    """
-    if len(candles) < 50: return None
-
-    atr    = calc_atr(candles)
-    if not atr: return None
-
-    closes  = [c["close"] for c in candles]
-    rsi     = calc_rsi(closes)
-    avg_b   = avg_body(candles)
-    ultima  = candles[-1]
-    previa  = candles[-2]
-
-    # Filtro apertura US500
-    if symbol == "OTC_SPC":
-        dt = datetime.now(timezone.utc)
-        if dt.hour == 16 and dt.minute < 15:
-            return None
-
-    # Detectar fractales
     swing_highs, swing_lows = [], []
-    for i in range(2, len(candles) - 2):
-        c = candles[i]
-        if (c["high"] > candles[i-1]["high"] and c["high"] > candles[i-2]["high"] and
-                c["high"] > candles[i+1]["high"] and c["high"] > candles[i+2]["high"]):
+    for i in range(2, len(velas_cerradas) - 2):
+        c = velas_cerradas[i]
+        if (c["high"] > velas_cerradas[i-1]["high"] and c["high"] > velas_cerradas[i-2]["high"] and
+                c["high"] > velas_cerradas[i+1]["high"] and c["high"] > velas_cerradas[i+2]["high"]):
             swing_highs.append({"index": i, "price": c["high"]})
-        if (c["low"] < candles[i-1]["low"] and c["low"] < candles[i-2]["low"] and
-                c["low"] < candles[i+1]["low"] and c["low"] < candles[i+2]["low"]):
+        if (c["low"] < velas_cerradas[i-1]["low"] and c["low"] < velas_cerradas[i-2]["low"] and
+                c["low"] < velas_cerradas[i+1]["low"] and c["low"] < velas_cerradas[i+2]["low"]):
             swing_lows.append({"index": i, "price": c["low"]})
 
-    if len(swing_highs) < 2 or len(swing_lows) < 2: return None
+    if not swing_highs or not swing_lows: return None
 
-    last_sh = swing_highs[-1]["price"]
-    last_sl = swing_lows[-1]["price"]
-    curr    = ultima["close"]
-    rango   = last_sh - last_sl
+    last_sh    = swing_highs[-1]["price"]
+    last_sl    = swing_lows[-1]["price"]
+    curr_close = ultima["close"]
+    rango_pts  = abs(last_sh - last_sl)
 
-    # Rango minimo 2x ATR
-    if rango < atr * 2 or rango <= 0: return None
+    if rango_pts < atr_val: return None  # Rango < ATR = ruido
 
-    # Trigger con cuerpo fuerte
-    trigger_body  = abs(ultima["close"] - ultima["open"])
-    strong_candle = trigger_body > avg_b * 1.5 if avg_b > 0 else True
-    trigger_bear  = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"] and strong_candle
-    trigger_bull  = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"] and strong_candle
+    trigger_bajista = (ultima["close"] < ultima["open"]) and (ultima["close"] < previa["low"])
+    trigger_alcista = (ultima["close"] > ultima["open"]) and (ultima["close"] > previa["high"])
 
-    # SHORT — zona Premium + RSI > 60
-    fib_618_bear = last_sh - (rango * 0.382)
-    fib_786_bear = last_sh - (rango * 0.214)
-    rsi_bear_ok  = rsi is None or rsi > 60
-    if fib_618_bear <= curr <= fib_786_bear and trigger_bear and rsi_bear_ok:
-        return {
-            "direction": "SHORT",
-            "strategy":  "SMC Premium Zone v2",
-            "price":     curr,
-            "sl_price":  round(last_sh + atr * 0.5, 5),
-            "detail":    f"Retest Premium 61.8% | RSI:{round(rsi,1) if rsi else '?'} | SH:{round(last_sh,4)} | Fib:{round(fib_618_bear,4)}-{round(fib_786_bear,4)}",
-            "rsi":       round(rsi, 1) if rsi else None,
-        }
+    # SHORT — zona Premium (precio < EMA 200)
+    if curr_close < ema_200 and curr_close > last_sl and curr_close < last_sh:
+        fib_618 = last_sh - (rango_pts * 0.382)
+        fib_786 = last_sh - (rango_pts * 0.214)
+        if fib_618 <= curr_close <= fib_786 and trigger_bajista:
+            return {"dir": "MULTDOWN", "sl_precio": last_sh + (atr_val * 0.5), "entry": curr_close}
 
-    # LONG — zona Discount + RSI < 40
-    fib_618_bull = last_sl + (rango * 0.382)
-    fib_786_bull = last_sl + (rango * 0.214)
-    rsi_bull_ok  = rsi is None or rsi < 40
-    if fib_786_bull <= curr <= fib_618_bull and trigger_bull and rsi_bull_ok:
-        return {
-            "direction": "LONG",
-            "strategy":  "SMC Discount Zone v2",
-            "price":     curr,
-            "sl_price":  round(last_sl - atr * 0.5, 5),
-            "detail":    f"Retest Discount 61.8% | RSI:{round(rsi,1) if rsi else '?'} | SL:{round(last_sl,4)} | Fib:{round(fib_786_bull,4)}-{round(fib_618_bull,4)}",
-            "rsi":       round(rsi, 1) if rsi else None,
-        }
+    # LONG — zona Discount (precio > EMA 200)
+    elif curr_close > ema_200 and curr_close < last_sh and curr_close > last_sl:
+        fib_618 = last_sl + (rango_pts * 0.382)
+        fib_786 = last_sl + (rango_pts * 0.214)
+        if fib_786 <= curr_close <= fib_618 and trigger_alcista:
+            return {"dir": "MULTUP", "sl_precio": last_sl - (atr_val * 0.5), "entry": curr_close}
 
     return None
 
-# ── EMA Structure Trend — GBP/JPY ────────────────────────────────
-def strat_ema_struct(symbol, config, candles):
-    """
-    EMA 50/200 Golden/Death Cross — validado en backtesting.
-    Filtros: RSI momentum + precio del lado correcto de EMA200.
-    """
-    closes = [c["close"] for c in candles]
-    if len(closes) < 210: return None
-    e50  = calc_ema(closes, 50)
-    e200 = calc_ema(closes, 200)
-    atr  = calc_atr(candles, 14)
-    rsi  = calc_rsi(closes)
-    curr = candles[-1]["close"]
-    mult = config.get("trailing_atr_mult", 1.5)
-    if not atr or len(e50) < 2 or len(e200) < 2: return None
 
-    # Golden Cross — EMA50 cruza sobre EMA200
-    if (e50[-2] <= e200[-2] and e50[-1] > e200[-1]
-            and curr > e200[-1]
-            and (rsi is None or rsi > 50)):
-        return {
-            "direction": "LONG", "strategy": "Golden Cross 50/200",
-            "price": curr, "rsi": round(rsi,1) if rsi else None,
-            "sl_price": round(curr - atr * mult, 3),
-            "detail": f"EMA50 cruzo sobre EMA200 | RSI:{round(rsi,1) if rsi else '?'} | precio > EMA200",
-        }
+# ══════════════════════════════════════════
+#  SIZING Y ENVIO DE ORDEN
+# ══════════════════════════════════════════
+async def calcular_sizing_y_enviar(ws, señal_data, sesion):
+    global trade_abierto, direction_actual, trailing_sl_actual, ultimo_ctx
 
-    # Death Cross — EMA50 cruza bajo EMA200
-    if (e50[-2] >= e200[-2] and e50[-1] < e200[-1]
-            and curr < e200[-1]
-            and (rsi is None or rsi < 50)):
-        return {
-            "direction": "SHORT", "strategy": "Death Cross 50/200",
-            "price": curr, "rsi": round(rsi,1) if rsi else None,
-            "sl_price": round(curr + atr * mult, 3),
-            "detail": f"EMA50 cruzo bajo EMA200 | RSI:{round(rsi,1) if rsi else '?'} | precio < EMA200",
-        }
-    return None
+    if balance_actual is None or balance_actual <= 0: return
 
-# ─────────────────────────────────────────────
-# TRAILING STOP — 3 ETAPAS (del v5)
-# Etapa 0: SL fijo inicial
-# Etapa 1: profit >= 1R → Break-even
-# Etapa 2: profit >= 2R → Trailing vela a vela
-# Etapa 3: profit >= 3R → Trailing agresivo (body de vela)
-# ─────────────────────────────────────────────
-def calc_sl_amount(stake, entry_price, sl_price, direction, multiplier):
-    if entry_price <= 0: return round(stake * 0.5, 2)
-    delta  = abs(entry_price - sl_price) / entry_price
-    amount = stake * delta * multiplier
-    return round(max(0.01, min(amount, stake)), 2)
+    direction   = señal_data["dir"]
+    entry_price = señal_data["entry"]
+    sl_precio   = señal_data["sl_precio"]
 
-async def trailing_stop_task(contract_id: int, ctx: dict):
-    symbol           = ctx["symbol"]
-    direction        = ctx["direction"]
-    entry_price      = ctx["entry_price"]
-    stake            = ctx["stake"]
-    multiplier       = ctx["multiplier"]
-    trailing_mode    = ctx["trailing_mode"]
-    atr_mult         = ctx.get("atr_mult", 2.0)
-    current_sl_price = ctx["initial_sl_price"]
-    initial_sl_price = ctx["initial_sl_price"]
-    last_epoch       = None
-    stage            = 0
+    riesgo_usd  = balance_actual * RIESGO_PCT
+    dist_pct    = abs(entry_price - sl_precio) / entry_price
+    if dist_pct == 0: return
 
-    stage_names = ["Inicial", "Break-even 🔒", "ATR Trail 📊", "Trailing vela 📈", "Trailing agresivo 🚀"]
-    atr_est     = abs(entry_price - initial_sl_price) / 0.3  # ATR estimado desde SL estructural
+    stake_calculado = riesgo_usd / (dist_pct * MULTIPLIER)
+    stake_final     = max(round(stake_calculado, 2), STAKE_MINIMO)
+    sl_usd_deriv    = round(riesgo_usd, 2)
+    if sl_usd_deriv > stake_final:
+        stake_final = sl_usd_deriv
 
-    def calc_profit_r(curr_price):
-        dist = abs(entry_price - initial_sl_price)
-        if dist == 0: return 0.0
-        return (curr_price - entry_price) / dist if direction == "LONG" else (entry_price - curr_price) / dist
+    emoji  = "🟢" if direction == "MULTUP" else "🔴"
+    config = SESIONES[sesion]
+    hora   = datetime.now(TZ_UTC).strftime("%H:%M UTC")
 
-    print(f"[trailing] Iniciado | {contract_id} | {symbol} {direction} | modo:{trailing_mode}")
-
-    try:
-        async with websockets.connect(DERIV_WS_URL) as ws_t:
-            await ws_t.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-            await ws_t.recv()
-            await ws_t.send(json.dumps({
-                "proposal_open_contract": 1,
-                "contract_id": contract_id,
-                "subscribe": 1
-            }))
-
-            async for raw in ws_t:
-                msg = json.loads(raw)
-                mt  = msg.get("msg_type")
-
-                # ── Cierre del contrato ───────────────────────────────
-                if mt == "proposal_open_contract":
-                    poc = msg.get("proposal_open_contract", {})
-                    if poc.get("status") in ("sold", "expired") or not poc.get("is_valid_to_sell", True):
-                        profit = float(poc.get("profit", 0))
-                        active_contracts.pop(contract_id, None)
-                        shared.registrar_trade(
-                            "Scanner", ctx["symbol"], ctx["direction"],
-                            profit, ctx["stake"], ctx["entry_price"], 0
-                        )
-                        stats = shared.get_stats()
-                        await send_telegram(
-                            f"{'💚' if profit >= 0 else '🔴'} *CONTRATO CERRADO*\n"
-                            f"Activo: {ctx['name']} | {direction}\n"
-                            f"Resultado: *${round(profit, 2)}*\n"
-                            f"Etapa al cierre: _{stage_names[min(stage,4)]}_\n"
-                            f"Día: ${stats['profit']} | WR: {stats['wr']}%"
-                        )
-                        print(f"[trailing] {contract_id} cerrado | profit:${profit}")
-                        return
-                    if entry_price <= 0:
-                        entry_price = float(poc.get("buy_price", 0))
-                        ctx["entry_price"] = entry_price
-
-                # ── Logica por vela nueva ─────────────────────────────
-                store = candle_store.get(symbol, [])
-                if len(store) < 2: continue
-                prev_c = store[-2]
-                curr_c = store[-1]
-                if prev_c["epoch"] == last_epoch: continue
-                last_epoch = prev_c["epoch"]
-
-                curr_price = curr_c["close"]
-                profit_r   = calc_profit_r(curr_price)
-
-                # Subir de etapa segun profit
-                new_stage = 4 if profit_r >= 5.0 else (3 if profit_r >= 3.0 else (2 if profit_r >= 2.0 else (1 if profit_r >= 1.0 else 0)))
-                if new_stage > stage:
-                    stage = new_stage
-                    print(f"[trailing] {contract_id} — ETAPA {stage}: {stage_names[min(stage,4)]} ({round(profit_r,2)}R)")
-                    await send_telegram(
-                        f"📊 *TRAILING UPDATE — {ctx['name']}*\n"
-                        f"Contrato: `{contract_id}` | {direction}\n"
-                        f"Profit: *{round(profit_r,2)}R*\n"
-                        f"Nueva etapa: _{stage_names[min(stage,4)]}_"
-                    )
-
-                if stage == 0: continue
-
-                # ── Calcular nuevo SL — trailing optimizado ───────────
-                new_sl = None
-
-                if stage == 1:   # Break-even + buffer 0.3 ATR
-                    be = round(entry_price + atr_est * 0.3, 5) if direction == "LONG" else round(entry_price - atr_est * 0.3, 5)
-                    if direction == "LONG"  and be > current_sl_price: new_sl = be
-                    if direction == "SHORT" and be < current_sl_price: new_sl = be
-
-                elif stage == 2:  # ATR 1.5x desde entry — espacio en moves medianos
-                    trail = round(entry_price + atr_est * 1.5, 5) if direction == "LONG" else round(entry_price - atr_est * 1.5, 5)
-                    if direction == "LONG"  and trail > current_sl_price: new_sl = trail
-                    if direction == "SHORT" and trail < current_sl_price: new_sl = trail
-
-                elif stage == 3:  # Low/High vela anterior — trailing activo
-                    c = prev_c["low"] if direction == "LONG" else prev_c["high"]
-                    if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
-                        new_sl = round(c, 5)
-
-                elif stage == 4:  # Body vela anterior — maxima captura
-                    c = min(prev_c["open"], prev_c["close"]) if direction == "LONG" else max(prev_c["open"], prev_c["close"])
-                    if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
-                        new_sl = round(c, 5)
-
-                if new_sl is None: continue
-
-                # Enviar contract_update con monto dinamico real
-                sl_amount = calc_sl_amount(stake, entry_price, new_sl, direction, multiplier)
-                try:
-                    await ws_t.send(json.dumps({
-                        "contract_update": 1,
-                        "contract_id": contract_id,
-                        "limit_order": {
-                            "stop_loss": {"order_type": "stop_loss", "order_amount": sl_amount}
-                        }
-                    }))
-                    current_sl_price = new_sl
-                    active_contracts[contract_id]["current_sl_price"] = new_sl
-                    print(f"[trailing] {contract_id} — SL → {new_sl} (${sl_amount})")
-                except Exception as e:
-                    print(f"[trailing update error] {e}")
-
-    except Exception as e:
-        print(f"[trailing task error] {contract_id} — {e}")
-        active_contracts.pop(contract_id, None)
-
-# ─────────────────────────────────────────────
-# PORTFOLIO CHECK — WS secundario (del v5)
-# ─────────────────────────────────────────────
-async def get_open_contract_count() -> int:
-    try:
-        async with websockets.connect(DERIV_WS_URL) as ws2:
-            await ws2.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-            await ws2.recv()
-            await ws2.send(json.dumps({"portfolio": 1}))
-            while True:
-                raw = await asyncio.wait_for(ws2.recv(), timeout=8)
-                msg = json.loads(raw)
-                if msg.get("msg_type") == "portfolio":
-                    contracts = msg.get("portfolio", {}).get("contracts", [])
-                    return len([c for c in contracts if c.get("contract_type","").startswith("MULT")])
-    except Exception as e:
-        print(f"[portfolio error] {e} — asumiendo 0")
-        return 0
-
-# ─────────────────────────────────────────────
-# ABRIR TRADE (del v5 + multiplier dinamico del v7)
-# ─────────────────────────────────────────────
-async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config):
-    """
-    Abre el contrato en WS secundario para no interferir con el loop principal.
-    Incluye limit_order con SL en el mismo buy request.
-    """
-    sl_amount = calc_sl_amount(stake, stake, sl_price, direction, multiplier)
-    # Clamp: Deriv requiere que sl_amount <= stake
-    sl_amount = min(sl_amount, stake)
-    sl_amount = max(sl_amount, 0.01)
-
-    req = {
-        "buy": 1, "price": stake,
-        "parameters": {
-            "amount": stake, "basis": "stake",
-            "contract_type": "MULTUP" if direction == "LONG" else "MULTDOWN",
-            "currency": account_currency,
-            "multiplier": multiplier,
-            "product_type": "basic",
-            "symbol": symbol,
-            "limit_order": {
-                "stop_loss": sl_amount   # numero directo, no objeto
-            }
-        }
+    trade_abierto      = True
+    direction_actual   = direction
+    trailing_sl_actual = sl_usd_deriv
+    ultimo_ctx = {
+        "direction": direction, "hora": hora,
+        "sl_inicial_usd": sl_usd_deriv, "entry_price": entry_price,
+        "stake": stake_final, "sesion": sesion, "trailing": config["trailing"]
     }
 
-    # WS secundario — no compite con el loop principal
-    try:
-        async with websockets.connect(DERIV_WS_URL) as ws2:
-            await ws2.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-            await ws2.recv()  # auth response
-            await ws2.send(json.dumps(req))
-            while True:
-                raw = await asyncio.wait_for(ws2.recv(), timeout=10)
-                msg = json.loads(raw)
-                if msg.get("msg_type") == "buy":
-                    if msg.get("error"):
-                        return None, msg["error"]["message"]
-                    buy_data    = msg["buy"]
-                    contract_id = buy_data["contract_id"]
-                    buy_price   = float(buy_data["buy_price"])
+    limit_order = {"stop_loss": sl_usd_deriv}
+    if not config["trailing"] and config["tp_ratio"]:
+        limit_order["take_profit"] = round(sl_usd_deriv * config["tp_ratio"], 2)
 
-                    ctx = {
-                        "symbol":           symbol,
-                        "name":             config["name"],
-                        "direction":        direction,
-                        "entry_price":      buy_price,
-                        "stake":            stake,
-                        "multiplier":       multiplier,
-                        "initial_sl_price": sl_price,
-                        "current_sl_price": sl_price,
-                        "trailing_mode":    config.get("trailing_mode", "candle"),
-                        "atr_mult":         config.get("trailing_atr_mult", 2.0),
-                    }
-                    active_contracts[contract_id] = ctx
-                    asyncio.create_task(trailing_stop_task(contract_id, ctx))
-                    print(f"[trade OK] {symbol} {direction} | ID:{contract_id} | stake:${stake} | x{multiplier} | SL:${sl_amount}")
-                    return contract_id, None
-    except asyncio.TimeoutError:
-        return None, "Timeout confirmacion"
-    except Exception as e:
-        return None, str(e)
-
-# ─────────────────────────────────────────────
-# HANDLE SIGNAL — filtros + apertura + telegram
-# ─────────────────────────────────────────────
-async def handle_signal(ws, symbol, config, signal):
-    if symbol in assets_blocked:
-        return
-    direction = signal["direction"]
-
-    # Check balance diario compartido
-    if shared.is_pausado():
-        return
-
-    # Filtro de noticias
-    bloqueado, razon = await shared.check_news_filter(symbol)
-    if bloqueado:
-        print(f"[news block] {symbol} — {razon}")
-        await send_telegram(f"📰 Señal bloqueada por noticia\n{config['name']} | {direction}\n{razon}")
-        return
-
-    # Filtro H1 Inertia
-    if config.get("use_h1_inertia") and not check_h1_inertia(symbol, direction):
-        return
-
-    # Correlation Shield
-    if not check_correlation_shield(symbol):
-        return
-
-    # Risk Engine
-    stake, multiplier = get_risk_params(symbol, config, candle_store[symbol])
-    if not stake:
-        return
-
-    conf     = config.get("confidence", 0)
-    tf_map   = {60:"M1", 300:"M5", 900:"M15", 1800:"M30", 3600:"H1"}
-    tf       = tf_map.get(config["granularity"], "?")
-    d_emoji  = "🟢" if direction == "LONG" else "🔴"
-    rsi_str  = f"`{signal['rsi']}`" if signal.get("rsi") else "N/A"
-    warn     = f"\n_{signal['warning']}_" if signal.get("warning") else ""
-    trailing_desc = {
-        "candle": "Auto vela a vela 🤖",
-        "atr":    f"Auto ATR {config.get('trailing_atr_mult','?')}x 🤖",
-    }.get(config.get("trailing_mode", "candle"), "Auto 🤖")
-
-    trade_result = ""
-
-    # ── PAPER MODE — simular sin abrir trade real ─────────────
-    if shared.is_paper_mode():
-        shared.paper_open(
-            "Scanner", symbol, direction, stake, multiplier,
-            signal["price"], signal["sl_price"]
-        )
-        await shared.notify_paper_signal(
-            "Scanner", symbol, direction,
-            signal["strategy"], signal["price"], signal["sl_price"],
-            stake, multiplier, signal.get("detail","")
-        )
-        trade_result = f"📄 _Paper trade simulado — ${stake} x{multiplier}_"
-
-    # ── MODO REAL ─────────────────────────────────────────────
-    else:
-        open_count = await get_open_contract_count()
-        if open_count >= MAX_OPEN_CONTRACTS:
-            trade_result = (
-                f"⏸ _Slots llenos ({open_count}/{MAX_OPEN_CONTRACTS})_\n"
-                f"_Podés entrar manual si te convence_"
-            )
-        else:
-            contract_id, error = await open_trade(ws, symbol, direction, stake, multiplier, signal["sl_price"], config)
-            if error:
-                signal_cooldown[symbol] = int(datetime.now(timezone.utc).timestamp()) + 600
-                if "rate limit" in error.lower():
-                    print(f"[rate limit] {symbol} — pausado 10 min")
-                    return
-                if "not offered" in error.lower() or "not available" in error.lower():
-                    assets_blocked.add(symbol)
-                    await send_telegram(f"⚠️ *{config['name']}* no disponible\nIgnorado hasta reinicio.")
-                    return
-                trade_result = f"❌ _Error: {error}_"
-            else:
-                trade_result = (
-                    f"✅ *OPERACION ABIERTA*\n"
-                    f"Stake: *${stake}* | x{multiplier}\n"
-                    f"Contrato: `{contract_id}`\n"
-                    f"SL inicial: ${round(stake*0.5,2)} (auto)\n"
-                    f"Trailing: _{trailing_desc}_\n"
-                    f"_Etapas: BE@1R → Trailing@2R → Agresivo@3R_"
-                )
-
-    msg = (
-        f"{d_emoji} *SENAL — {config['name']}*\n"
-        f"──────────────────────────\n"
-        f"Direccion: *{direction}*\n"
-        f"Estrategia: _{signal['strategy']}_\n"
-        f"Hora: {now_utc()}  |  TF: {tf}\n"
-        f"Precio: `{signal['price']}`  |  RSI: {rsi_str}\n"
-        f"SL estructural: `{signal['sl_price']}`\n"
-        f"──────────────────────────\n"
-        f"_{signal.get('detail','')}_\n"
-        f"──────────────────────────\n"
-        f"{confidence_emoji(conf)} Confianza: *{conf}%*  |  Stake: *${stake}* x{multiplier}{warn}\n"
-        f"──────────────────────────\n"
-        f"{trade_result}"
-    )
-
-    print(f"\n{'='*55}")
-    print(f"  {symbol} | {direction} | {signal['strategy']} | ${stake} x{multiplier}")
-    print(f"{'='*55}\n")
-    await send_telegram(msg)
-
-# ─────────────────────────────────────────────
-# WEBSOCKET
-# ─────────────────────────────────────────────
-async def subscribe_candles(ws, symbol, granularity, label=""):
     await ws.send(json.dumps({
-        "ticks_history": symbol, "adjust_start_time": 1,
-        "count": 200, "end": "latest",
-        "granularity": granularity, "style": "candles", "subscribe": 1,
+        "buy": 1, "price": stake_final,
+        "parameters": {
+            "amount": stake_final, "basis": "stake",
+            "contract_type": direction, "currency": moneda,
+            "multiplier": MULTIPLIER, "symbol": SYMBOL,
+            "limit_order": limit_order
+        }
     }))
 
-async def process_message(ws, msg):
-    mt = msg.get("msg_type")
+    salida = "TP fijo 1:1" if not config["trailing"] else "Trailing SMC"
+    print(f"{emoji} ORDEN | {direction} | Entry: {entry_price} | SL: {round(sl_precio,2)} | Stake: ${stake_final}")
+    await enviar_telegram(
+        f"{emoji} *SMC ENTRY XAU/USD*\n"
+        f"📊 `{direction}` x{MULTIPLIER}\n"
+        f"📍 Entry: `{entry_price}`\n"
+        f"🛑 SL Estructural: `{round(sl_precio, 2)}`\n"
+        f"💵 Stake: *${stake_final}*\n"
+        f"🛡️ Riesgo: *${sl_usd_deriv}* (1%)\n"
+        f"🎯 {salida}"
+    )
 
-    if mt == "candles":
-        symbol = msg.get("echo_req", {}).get("ticks_history")
-        gran   = msg.get("echo_req", {}).get("granularity", 0)
-        if not symbol: return
-        candles = [
-            {"open": float(c["open"]), "high": float(c["high"]),
-             "low":  float(c["low"]),  "close": float(c["close"]), "epoch": c["epoch"]}
-            for c in msg.get("candles", [])
-        ]
-        if gran == 3600:
-            h1_store[symbol] = candles     # H1 para inertia filter
-            print(f"[{symbol}] H1 historial: {len(candles)} velas")
-        elif symbol in ASSETS:
-            candle_store[symbol] = candles
-            print(f"[{symbol}] Historial: {len(candles)} velas")
 
-    elif mt == "ohlc":
-        ohlc   = msg.get("ohlc", {})
-        symbol = ohlc.get("symbol")
-        if not symbol or symbol not in ASSETS: return
-        config = ASSETS[symbol]
-        if not in_session(config["session"]): return
+# ══════════════════════════════════════════
+#  TRAILING STOP — 3 FASES
+# ══════════════════════════════════════════
+async def actualizar_trailing_stop(ws):
+    global trailing_sl_actual
 
-        new_c = {
-            "open":  float(ohlc["open"]), "high": float(ohlc["high"]),
-            "low":   float(ohlc["low"]),  "close": float(ohlc["close"]),
-            "epoch": ohlc["epoch"],
-        }
+    if not trade_abierto or contrato_abierto_id is None or not ultimo_ctx: return
+    if len(velas) < 15: return
 
-        # Actualizar candle store del TF principal
-        store = candle_store[symbol]
-        if store and store[-1]["epoch"] == new_c["epoch"]:
-            store[-1] = new_c
-        else:
-            store.append(new_c)
-            if len(store) > 200: store.pop(0)
+    velas_cerradas = velas[:-1]
+    curr_price     = velas[-1]["close"]
+    entry_price    = ultimo_ctx.get("entry_price")
+    sl_usd_inicial = ultimo_ctx.get("sl_inicial_usd")
+    stake          = ultimo_ctx.get("stake", STAKE_MINIMO)
 
-        # first_signal_only check
-        if config.get("first_signal_only", False):
-            key = session_key(symbol)
-            if signal_emitted[symbol] == key: return
+    if not entry_price or not sl_usd_inicial: return
 
-        signal = run_strategy(symbol, config, store)
-        if signal:
-            # Anti-spam: no repetir señal por 3 velas (cooldown = granularity * 3)
-            now_epoch = int(datetime.now(timezone.utc).timestamp())
-            cooldown  = config.get("granularity", 900) * 3
-            last      = signal_cooldown.get(symbol, 0)
-            if now_epoch - last < cooldown:
-                return   # cooldown activo — ignorar señal
-            signal_cooldown[symbol] = now_epoch
+    r_puntos    = (sl_usd_inicial / stake) / MULTIPLIER * entry_price
+    profit_pts  = (curr_price - entry_price) if direction_actual == "MULTUP" else (entry_price - curr_price)
+    r_actual    = profit_pts / r_puntos if r_puntos > 0 else 0
 
-            if config.get("first_signal_only", False):
-                signal_emitted[symbol] = session_key(symbol)
-            await handle_signal(ws, symbol, config, signal)
+    nuevo_sl_precio = None
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-async def main():
-    global account_currency, account_balance
+    if r_actual < 1.0:
+        return  # Fase 0 — dejar respirar
 
-    print("=" * 55)
-    print("  Signal Scanner v8 — Smart Money Edition")
-    print("=" * 55)
+    elif 1.0 <= r_actual < 2.0:
+        nuevo_sl_precio = entry_price  # Fase 1 — Break-even
 
-    async with websockets.connect(DERIV_WS_URL) as ws:
-        await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-        auth = json.loads(await ws.recv())
-        if auth.get("error"):
-            print(f"Auth error: {auth['error']['message']}")
-            return
+    elif r_actual >= 2.0:
+        atr = calcular_atr(velas_cerradas)
+        nuevo_sl_precio = (curr_price - atr * 2.0) if direction_actual == "MULTUP" else (curr_price + atr * 2.0)
 
-        bal = auth["authorize"]
-        account_currency = bal.get("currency", "eUSDT")
-        account_balance  = float(bal.get("balance", 0))
-        print(f"Autenticado | Balance: {account_balance} {account_currency}\n")
+    if nuevo_sl_precio:
+        dist_pct     = abs(curr_price - nuevo_sl_precio) / curr_price
+        nuevo_sl_usd = max(round(dist_pct * MULTIPLIER * stake, 2), 0.10)
 
-        # Lanzar keepalive para evitar desconexiones por inactividad
-        keepalive_task = asyncio.create_task(keepalive(ws))
-
-        # Suscribir TF principal + H1 para inertia filter
-        for symbol, config in ASSETS.items():
-            # TF principal de la estrategia
-            await subscribe_candles(ws, symbol, config["granularity"])
-            print(f"  [{config['confidence']}%] {symbol} ({config['name']}) | {config['strategy']} | trailing:{config['trailing_mode']}")
-            await asyncio.sleep(0.3)
-
-            # H1 para inertia filter (solo si lo usa)
-            if config.get("use_h1_inertia"):
-                await subscribe_candles(ws, symbol, 3600)
-                print(f"  [{symbol}] H1 suscrito para inertia filter")
-                await asyncio.sleep(0.3)
-
-        print("\nScanner activo — esperando señales...\n")
-
-        # Startup message
-        await send_telegram(
-            "✅ *Signal Scanner v8 — ACTIVO*\n"
-            "──────────────────────────\n"
-            f"Balance: *{account_balance} {account_currency}*\n"
-            "──────────────────────────\n"
-            "Activos:\n"
-            "🔥 US500 — SMC $2.00 x(50-100)\n"
-            "✅ EUR/USD — SMC $1.00 x(50-100)\n"
-            "✅ GBP/JPY — EMA Cross $1.00 x(50-100)\n"
-            "──────────────────────────\n"
-            "Filtros activos: H1 Inertia + Correlation Shield\n"
-            "Trailing: BE@1R → Vela@2R → Agresivo@3R"
-        )
-
-        while True:
+        if trailing_sl_actual is None or nuevo_sl_usd < trailing_sl_actual:
+            trailing_sl_actual = nuevo_sl_usd
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60)
-                msg = json.loads(raw)
-                mt  = msg.get("msg_type", "")
-                if mt in ("buy", "portfolio", "proposal_open_contract", "ping"):
-                    continue
-                if "pong" in msg:
-                    continue
+                await ws.send(json.dumps({
+                    "contract_update": 1,
+                    "contract_id": contrato_abierto_id,
+                    "limit_order": {"stop_loss": trailing_sl_actual}
+                }))
+                fase = "Break-Even 🔒" if r_actual < 2.0 else "ATR Trailing 🚀"
+                print(f"🔄 Trailing | {fase} | {round(r_actual,1)}R | SL: ${nuevo_sl_usd}")
+            except Exception as e:
+                print(f"⚠️ Error trailing: {e}")
 
-                # Dashboard diario a las 21:00 UTC
-                await shared.check_and_send_dashboard(account_balance)
-                if msg.get("error"):
-                    err = msg["error"]
-                    if err.get("code") not in ("AlreadySubscribed", "MarketIsClosed"):
-                        print(f"[WS error] {err.get('message','')}")
-                    continue
-                await process_message(ws, msg)
 
-            except asyncio.TimeoutError:
-                print("[WS] Timeout 60s sin datos — reconectando en 3s...")
-                keepalive_task.cancel()
-                await asyncio.sleep(3)
-                break
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"[WS] Conexion cerrada ({e.code}) — reconectando en 3s...")
-                keepalive_task.cancel()
-                await asyncio.sleep(3)
-                break
+# ══════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════
+async def pedir_velas(ws):
+    await ws.send(json.dumps({
+        "ticks_history": SYMBOL, "adjust_start_time": 1, "count": CANDLES_COUNT,
+        "end": "latest", "start": 1, "style": "candles",
+        "granularity": GRANULARITY, "subscribe": 1
+    }))
 
-if __name__ == "__main__":
+async def deriv_bot():
+    global balance_actual, moneda, profit_dia, trades_ganados, trades_perdidos
+    global bot_pausado, trade_abierto, contrato_abierto_id, direction_actual
+    global trailing_sl_actual, ultimo_ctx, velas, vela_procesada_epoch
+
+    startup_notificado = False  # mensaje de inicio solo una vez
+    sesion_anterior    = None   # para detectar cambio de sesion
+
     while True:
         try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("Scanner detenido.")
-            break
+            async with websockets.connect(WS_URL) as ws:
+                await ws.send(json.dumps({"authorize": API_TOKEN}))
+
+                keepalive_task = None  # se lanza despues del auth
+
+                while True:
+                    raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+
+                    if "error" in raw:
+                        err = raw["error"]["message"]
+                        if "already subscribed" not in err.lower():
+                            print(f"🚨 ERROR: {err}")
+                        continue
+
+                    # ── AUTORIZACIÓN ──
+                    if "authorize" in raw:
+                        balance_actual = float(raw["authorize"]["balance"])
+                        moneda         = raw["authorize"].get("currency", "USD")
+                        print(f"🚀 XAU/USD SMC v9.1 | Saldo: ${balance_actual} {moneda}")
+                        if not startup_notificado:
+                            await enviar_telegram(
+                                f"⚡ *XAU/USD Bot SMC v9.1*\n"
+                                f"💰 Saldo: `${balance_actual} {moneda}`\n"
+                                f"⚙️ Keepalive activo | SMC + Sizing Dinamico"
+                            )
+                            startup_notificado = True
+                        else:
+                            print(f"[reconexion] Saldo: ${balance_actual} — sin notificar Telegram")
+                        await pedir_velas(ws)
+                        await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+                        # Lanzar keepalive
+                        if keepalive_task:
+                            keepalive_task.cancel()
+                        keepalive_task = asyncio.create_task(keepalive(ws))
+
+                    # ── PING RESPONSE — ignorar ──
+                    if raw.get("msg_type") == "ping" or "pong" in raw:
+                        continue
+
+                    # Dashboard diario a las 21:00 UTC
+                    if balance_actual:
+                        await shared.check_and_send_dashboard(balance_actual)
+
+                    # ── VELAS HISTÓRICAS ──
+                    if "candles" in raw:
+                        velas = [
+                            {"open": float(c["open"]), "high": float(c["high"]),
+                             "low": float(c["low"]), "close": float(c["close"]), "epoch": c["epoch"]}
+                            for c in raw["candles"]
+                        ]
+                        print(f"📊 {len(velas)} velas M15 cargadas.")
+
+                    # ── OHLC STREAMING ──
+                    if "ohlc" in raw and not bot_pausado:
+                        reset_diario()
+                        if balance_actual and balance_actual < SALDO_MINIMO:
+                            await enviar_telegram(f"⚠️ Saldo crítico: ${balance_actual}. Pausado.")
+                            bot_pausado = True
+                            continue
+
+                        sesion = sesion_activa()
+                        if not sesion:
+                            sesion_anterior = None
+                            continue
+
+                        # Notificar al entrar a una sesion nueva
+                        if sesion != sesion_anterior:
+                            sesion_anterior = sesion
+                            emojis = {"asia": "🌏", "londres": "🇬🇧", "ny": "🗽"}
+                            nombres = {"asia": "Asia (00:00-03:00 UTC)", "londres": "Londres (03:00-08:00 UTC)", "ny": "Nueva York (13:00-20:00 UTC)"}
+                            await enviar_telegram(
+                                f"{emojis.get(sesion,'📊')} *Sesion activa: {nombres.get(sesion, sesion)}*\n"
+                                f"💰 Saldo: `${balance_actual} {moneda}`\n"
+                                f"📈 Profit hoy: `${round(profit_dia, 2)}`\n"
+                                f"🤖 XAU/USD SMC v9.1 operando..."
+                            )
+
+                        c         = raw["ohlc"]
+                        nueva_vela = {
+                            "open": float(c["open"]), "high": float(c["high"]),
+                            "low": float(c["low"]),  "close": float(c["close"]),
+                            "epoch": c["epoch"]
+                        }
+
+                        if velas and velas[-1]["epoch"] == nueva_vela["epoch"]:
+                            velas[-1] = nueva_vela
+                        else:
+                            velas.append(nueva_vela)
+                            if len(velas) > 300: velas.pop(0)
+
+                        if trade_abierto:
+                            config = SESIONES[ultimo_ctx.get("sesion", sesion)]
+                            if config["trailing"]:
+                                await actualizar_trailing_stop(ws)
+                            continue
+
+                        # Evaluar señal solo en cierre de vela
+                        if len(velas) > 2 and velas[-2]["epoch"] != vela_procesada_epoch:
+                            vela_procesada_epoch = velas[-2]["epoch"]
+
+                            # Check noticias antes de operar
+                            bloqueado, razon = await shared.check_news_filter(SYMBOL)
+                            if bloqueado:
+                                print(f"[news block] {razon}")
+                                continue
+
+                            # Check balance diario compartido
+                            if shared.is_pausado():
+                                continue
+
+                            velas_cerradas = velas[:-1]
+                            señal = evaluar_señal(velas_cerradas)
+                            if señal:
+                                if shared.is_paper_mode():
+                                    await shared.notify_paper_signal(
+                                        "GoldBot", SYMBOL, señal["dir"],
+                                        "SMC", señal["entry"], señal["sl_precio"],
+                                        STAKE_MINIMO, MULTIPLIER
+                                    )
+                                else:
+                                    await calcular_sizing_y_enviar(ws, señal, sesion)
+
+                    # ── CONFIRMAR COMPRA ──
+                    if "buy" in raw and "contract_id" in raw.get("buy", {}):
+                        contrato_abierto_id = raw["buy"]["contract_id"]
+
+                    # ── CONTRATOS Y CIERRES ──
+                    if "proposal_open_contract" in raw:
+                        contract = raw["proposal_open_contract"]
+
+                        if contract.get("is_sold"):
+                            cid = contract.get("contract_id")
+                            if cid in contratos_vistos: continue
+                            contratos_vistos.add(cid)
+                            if contract.get("underlying") != SYMBOL: continue
+
+                            trade_abierto       = False
+                            contrato_abierto_id = None
+                            direction_actual    = None
+                            trailing_sl_actual  = None
+                            profit = float(contract.get("profit", 0))
+
+                            balance_actual = (float(contract["balance_after"])
+                                             if "balance_after" in contract
+                                             else round(balance_actual + profit, 2))
+                            profit_dia += profit
+
+                            # Registrar en shared (balance diario compartido)
+                            shared.registrar_trade(
+                                "GoldBot", SYMBOL,
+                                ultimo_ctx.get("direction", "?"),
+                                profit, ultimo_ctx.get("stake", 0),
+                                ultimo_ctx.get("entry_price", 0), 0
+                            )
+
+                            stats  = shared.get_stats()
+                            emoji  = "🔥" if profit > 0 else "❌"
+                            signo  = "+" if profit > 0 else ""
+                            resumen = (
+                                f"{emoji} *{'WIN' if profit > 0 else 'LOSS'} {signo}${round(profit,2)}*\n"
+                                f"📊 XAU/USD {ultimo_ctx.get('direction','?')} x{MULTIPLIER}\n"
+                                f"💵 Saldo: ${balance_actual} {moneda}\n"
+                                f"📈 Día: ${stats['profit']} / ${shared.META_DIARIA}\n"
+                                f"🎯 WR: {stats['wr']}% ({stats['ganados']}G/{stats['perdidos']}P)"
+                            )
+                            print(resumen.replace("\n", " | "))
+                            await enviar_telegram(resumen)
+
+                        # Recuperar trade tras reinicio
+                        elif (contract.get("underlying") == SYMBOL
+                              and contract.get("current_spot")
+                              and not trade_abierto):
+                            cid           = contract.get("contract_id")
+                            ct            = contract.get("contract_type", "MULTDOWN")
+                            sl            = abs(float(contract.get("limit_order", {}).get("stop_loss", {}).get("order_amount", 10.0)))
+                            sesion_actual = sesion_activa() or "londres"
+                            ultimo_ctx = {
+                                "direction": ct, "hora": datetime.now(TZ_UTC).strftime("%H:%M UTC"),
+                                "sl_inicial_usd": sl,
+                                "entry_price": float(contract.get("entry_spot", contract.get("current_spot"))),
+                                "stake": float(contract.get("buy_price", 2.00)),
+                                "sesion": sesion_actual,
+                                "trailing": SESIONES[sesion_actual]["trailing"]
+                            }
+                            trade_abierto       = True
+                            contrato_abierto_id = cid
+                            direction_actual    = ct
+                            trailing_sl_actual  = sl
+                            print(f"🔒 Trade recuperado: {cid} | SL: ${sl}")
+
+        except asyncio.TimeoutError:
+            if keepalive_task:
+                keepalive_task.cancel()
+            print("⚠️ WS timeout (60s sin datos) — reconectando en 3s...")
+            await asyncio.sleep(3)
         except Exception as e:
+            if keepalive_task:
+                keepalive_task.cancel()
             err_str = str(e)
-            if "1001" in err_str or "going away" in err_str or "ConnectionClosed" in err_str:
-                print(f"[WS] Cloudflare restart — reconectando en 3s...")
-                import time; time.sleep(3)
+            if "1001" in err_str or "going away" in err_str or "no close frame" in err_str:
+                print(f"⚠️ WS restart — reconectando en 3s: {e}")
+                await asyncio.sleep(3)
             else:
-                print(f"[Error critico] {e} — reiniciando en 10s...")
-                import time; time.sleep(10)
+                print(f"⚠️ Desconexion — reconectando en 5s: {e}")
+                await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(deriv_bot())
+    except KeyboardInterrupt:
+        print("\nBot detenido.")
