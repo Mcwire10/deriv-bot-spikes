@@ -490,10 +490,14 @@ async def get_open_contract_count() -> int:
 # ─────────────────────────────────────────────
 async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config):
     """
-    Abre el contrato SIN limit_order para evitar errores de validacion.
-    Inmediatamente despues aplica el SL via contract_update.
-    Este es el mismo flujo que usa el gold bot v9.
+    Abre el contrato en WS secundario para no interferir con el loop principal.
+    Incluye limit_order con SL en el mismo buy request.
     """
+    sl_amount = calc_sl_amount(stake, stake, sl_price, direction, multiplier)
+    # Clamp: Deriv requiere que sl_amount <= stake
+    sl_amount = min(sl_amount, stake)
+    sl_amount = max(sl_amount, 0.01)
+
     req = {
         "buy": 1, "price": stake,
         "parameters": {
@@ -503,52 +507,48 @@ async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config)
             "multiplier": multiplier,
             "product_type": "basic",
             "symbol": symbol,
+            "limit_order": {
+                "stop_loss": sl_amount   # numero directo, no objeto
+            }
         }
     }
-    await ws.send(json.dumps(req))
+
+    # WS secundario — no compite con el loop principal
     try:
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=10)
-            msg = json.loads(raw)
-            if msg.get("msg_type") == "buy":
-                if msg.get("error"):
-                    return None, msg["error"]["message"]
-                buy_data    = msg["buy"]
-                contract_id = buy_data["contract_id"]
-                buy_price   = float(buy_data["buy_price"])
+        async with websockets.connect(DERIV_WS_URL) as ws2:
+            await ws2.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+            await ws2.recv()  # auth response
+            await ws2.send(json.dumps(req))
+            while True:
+                raw = await asyncio.wait_for(ws2.recv(), timeout=10)
+                msg = json.loads(raw)
+                if msg.get("msg_type") == "buy":
+                    if msg.get("error"):
+                        return None, msg["error"]["message"]
+                    buy_data    = msg["buy"]
+                    contract_id = buy_data["contract_id"]
+                    buy_price   = float(buy_data["buy_price"])
 
-                # Aplicar SL via contract_update (mas compatible que limit_order en buy)
-                sl_amount = calc_sl_amount(buy_price, buy_price, sl_price, direction, multiplier)
-                try:
-                    await ws.send(json.dumps({
-                        "contract_update": 1,
-                        "contract_id": contract_id,
-                        "limit_order": {
-                            "stop_loss": {"order_type": "stop_loss", "order_amount": sl_amount}
-                        }
-                    }))
-                    print(f"[SL] Aplicado via contract_update | ${sl_amount}")
-                except Exception as e:
-                    print(f"[SL warning] No se pudo aplicar SL inicial: {e}")
-
-                ctx = {
-                    "symbol":           symbol,
-                    "name":             config["name"],
-                    "direction":        direction,
-                    "entry_price":      buy_price,
-                    "stake":            stake,
-                    "multiplier":       multiplier,
-                    "initial_sl_price": sl_price,
-                    "current_sl_price": sl_price,
-                    "trailing_mode":    config.get("trailing_mode", "candle"),
-                    "atr_mult":         config.get("trailing_atr_mult", 2.0),
-                }
-                active_contracts[contract_id] = ctx
-                asyncio.create_task(trailing_stop_task(contract_id, ctx))
-                print(f"[trade OK] {symbol} {direction} | ID:{contract_id} | stake:${stake} | x{multiplier}")
-                return contract_id, None
+                    ctx = {
+                        "symbol":           symbol,
+                        "name":             config["name"],
+                        "direction":        direction,
+                        "entry_price":      buy_price,
+                        "stake":            stake,
+                        "multiplier":       multiplier,
+                        "initial_sl_price": sl_price,
+                        "current_sl_price": sl_price,
+                        "trailing_mode":    config.get("trailing_mode", "candle"),
+                        "atr_mult":         config.get("trailing_atr_mult", 2.0),
+                    }
+                    active_contracts[contract_id] = ctx
+                    asyncio.create_task(trailing_stop_task(contract_id, ctx))
+                    print(f"[trade OK] {symbol} {direction} | ID:{contract_id} | stake:${stake} | x{multiplier} | SL:${sl_amount}")
+                    return contract_id, None
     except asyncio.TimeoutError:
         return None, "Timeout confirmacion"
+    except Exception as e:
+        return None, str(e)
 
 # ─────────────────────────────────────────────
 # HANDLE SIGNAL — filtros + apertura + telegram
@@ -591,6 +591,12 @@ async def handle_signal(ws, symbol, config, signal):
     else:
         contract_id, error = await open_trade(ws, symbol, direction, stake, multiplier, signal["sl_price"], config)
         if error:
+            # Cooldown de 10 minutos tras cualquier error
+            signal_cooldown[symbol] = int(datetime.now(timezone.utc).timestamp()) + 600
+            if "rate limit" in error.lower():
+                # Rate limit — no spamear Telegram, solo loguear
+                print(f"[rate limit] {symbol} — pausado 10 min")
+                return
             trade_result = f"❌ _Error: {error}_"
         else:
             trade_result = (
@@ -685,7 +691,7 @@ async def process_message(ws, msg):
             cooldown  = config.get("granularity", 900) * 3
             last      = signal_cooldown.get(symbol, 0)
             if now_epoch - last < cooldown:
-                continue
+                return   # cooldown activo — ignorar señal
             signal_cooldown[symbol] = now_epoch
 
             if config.get("first_signal_only", False):
