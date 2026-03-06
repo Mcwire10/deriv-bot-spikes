@@ -36,7 +36,7 @@ def get_stake(confidence: int):
     return None  # XAG/USD y cualquier conf < 70 — solo señal
 
 ASSET_SCORES = {
-    "frxXAUUSD": {"confidence": 95, "win_rate": 0.65, "r_avg": 2.0, "score": 89},
+    # frxXAUUSD — cubierto por el gold bot separado
     "frxEURUSD": {"confidence": 85, "win_rate": 0.56, "r_avg": 2.2, "score": 81},
     "frxGBPUSD": {"confidence": 75, "win_rate": 0.51, "r_avg": 1.9, "score": 70},
     "frxXAGUSD": {"confidence": 60, "win_rate": 0.45, "r_avg": 3.5, "score": 51},
@@ -48,15 +48,7 @@ ASSET_SCORES = {
 # ASSETS
 # ─────────────────────────────────────────────
 ASSETS = {
-    "frxXAUUSD": {
-        "name": "Gold (XAU/USD)", "granularity": 900,
-        "strategy": "rsi_divergence", "session": "london",
-        "rsi_period": 14, "impulse_candles": 4,
-        "spike_multiplier": 3.0, "spike_lookback": 20,
-        "first_signal_only": True, "confidence": 95,
-        "trailing_mode": "candle",
-        "trailing_after_r": 0.0,       # activo desde el inicio
-    },
+    # frxXAUUSD — cubierto por xauusd_rsi_bot.py
     "frxEURUSD": {
         "name": "EUR/USD", "granularity": 900,
         "strategy": "london_breakout", "session": "london_open",
@@ -776,7 +768,6 @@ async def main():
             f"Balance: *{bal.get('balance')} {account_currency}*\n"
             "──────────────────────────\n"
             "Activos monitoreados:\n"
-            "🔥 Gold XAU/USD — AUTO $2.00\n"
             "✅ EUR/USD — AUTO $1.00\n"
             "🟡 GBP/USD — AUTO $0.50\n"
             "✅ GBP/JPY — AUTO $1.00\n"
