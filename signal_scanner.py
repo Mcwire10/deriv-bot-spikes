@@ -41,7 +41,7 @@ ASSET_SCORES = {
     "frxGBPUSD": {"confidence": 75, "win_rate": 0.51, "r_avg": 1.9, "score": 70},
     "frxXAGUSD": {"confidence": 60, "win_rate": 0.45, "r_avg": 3.5, "score": 51},
     "frxGBPJPY": {"confidence": 80, "win_rate": 0.54, "r_avg": 2.5, "score": 78},
-    "otc_SPC":   {"confidence": 90, "win_rate": 0.64, "r_avg": 1.5, "score": 92},
+    "OTC_SPC": {"confidence": 90, "win_rate": 0.64, "r_avg": 1.5, "score": 92},
 }
 
 # ─────────────────────────────────────────────
@@ -92,8 +92,8 @@ ASSETS = {
         "trailing_mode": "atr",
         "trailing_after_r": 0.0,
     },
-    "otc_SPC": {
-        "name": "US SP 500", "granularity": 300,
+    "OTC_SPC": {
+        "name": "US 500 (S&P 500)", "granularity": 300,
         "strategy": "ema_trend_pullback", "session": "wallstreet",
         "ema_fast": 9, "ema_slow": 21, "atr_period": 14,
         "trailing_atr_mult": 2.0, "volume_lookback": 10,
