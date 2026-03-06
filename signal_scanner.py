@@ -769,6 +769,24 @@ async def main():
 
         print("\nScanner activo — esperando señales...\n")
 
+        # Mensaje de startup a Telegram para confirmar que el bot funciona
+        startup_msg = (
+            "✅ *Signal Scanner v5 — ACTIVO*\n"
+            "──────────────────────────\n"
+            f"Balance: *{bal.get('balance')} {account_currency}*\n"
+            "──────────────────────────\n"
+            "Activos monitoreados:\n"
+            "🔥 Gold XAU/USD — AUTO $2.00\n"
+            "✅ EUR/USD — AUTO $1.00\n"
+            "🟡 GBP/USD — AUTO $0.50\n"
+            "✅ GBP/JPY — AUTO $1.00\n"
+            "🔥 US500 — AUTO $2.00\n"
+            "⚠️ Silver — Solo señal\n"
+            "──────────────────────────\n"
+            "Esperando señales..."
+        )
+        await send_telegram(startup_msg)
+
         while True:
             try:
                 raw = await ws.recv()
