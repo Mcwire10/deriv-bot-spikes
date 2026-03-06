@@ -14,6 +14,7 @@ import numpy as np
 from datetime import datetime, timezone
 from collections import defaultdict
 import os
+import shared
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -66,7 +67,7 @@ ASSETS = {
 SESSIONS = {
     "london_open":         (8,  12),
     "asia_london_overlap": (6,  9),
-    "wallstreet":          (15, 19),
+    "wallstreet":          (16, 21),  # Wall Street abre 16:30 UTC, margen de seguridad
     "all":                 (0,  24),
 }
 
@@ -77,6 +78,7 @@ candle_store     = defaultdict(list)   # M granularity por activo
 h1_store         = defaultdict(list)   # H1 para inertia filter
 signal_emitted   = defaultdict(lambda: None)
 signal_cooldown  = {}   # { symbol: last_signal_epoch } — evita spam entre velas
+assets_blocked   = set()  # activos no disponibles — skip hasta reinicio
 active_contracts: dict = {}
 account_currency = "eUSDT"
 account_balance  = 0.0
@@ -382,12 +384,17 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                     if poc.get("status") in ("sold", "expired") or not poc.get("is_valid_to_sell", True):
                         profit = float(poc.get("profit", 0))
                         active_contracts.pop(contract_id, None)
+                        shared.registrar_trade(
+                            "Scanner", ctx["symbol"], ctx["direction"],
+                            profit, ctx["stake"], ctx["entry_price"], 0
+                        )
+                        stats = shared.get_stats()
                         await send_telegram(
                             f"{'💚' if profit >= 0 else '🔴'} *CONTRATO CERRADO*\n"
                             f"Activo: {ctx['name']} | {direction}\n"
                             f"Resultado: *${round(profit, 2)}*\n"
                             f"Etapa al cierre: _{stage_names[min(stage,3)]}_\n"
-                            f"Contratos activos: {len(active_contracts)}"
+                            f"Día: ${stats['profit']} | WR: {stats['wr']}%"
                         )
                         print(f"[trailing] {contract_id} cerrado | profit:${profit}")
                         return
@@ -554,17 +561,30 @@ async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config)
 # HANDLE SIGNAL — filtros + apertura + telegram
 # ─────────────────────────────────────────────
 async def handle_signal(ws, symbol, config, signal):
+    if symbol in assets_blocked:
+        return
     direction = signal["direction"]
 
-    # Filtro H1 Inertia — solo a favor de tendencia macro
+    # Check balance diario compartido
+    if shared.is_pausado():
+        return
+
+    # Filtro de noticias
+    bloqueado, razon = await shared.check_news_filter(symbol)
+    if bloqueado:
+        print(f"[news block] {symbol} — {razon}")
+        await send_telegram(f"📰 Señal bloqueada por noticia\n{config['name']} | {direction}\n{razon}")
+        return
+
+    # Filtro H1 Inertia
     if config.get("use_h1_inertia") and not check_h1_inertia(symbol, direction):
         return
 
-    # Correlation Shield — no sobreexponerse a misma moneda
+    # Correlation Shield
     if not check_correlation_shield(symbol):
         return
 
-    # Risk Engine — stake y multiplier dinamicos
+    # Risk Engine
     stake, multiplier = get_risk_params(symbol, config, candle_store[symbol])
     if not stake:
         return
@@ -581,32 +601,49 @@ async def handle_signal(ws, symbol, config, signal):
     }.get(config.get("trailing_mode", "candle"), "Auto 🤖")
 
     trade_result = ""
-    open_count   = await get_open_contract_count()
 
-    if open_count >= MAX_OPEN_CONTRACTS:
-        trade_result = (
-            f"⏸ _Slots llenos ({open_count}/{MAX_OPEN_CONTRACTS})_\n"
-            f"_Podés entrar manual si te convence_"
+    # ── PAPER MODE — simular sin abrir trade real ─────────────
+    if shared.is_paper_mode():
+        shared.paper_open(
+            "Scanner", symbol, direction, stake, multiplier,
+            signal["price"], signal["sl_price"]
         )
+        await shared.notify_paper_signal(
+            "Scanner", symbol, direction,
+            signal["strategy"], signal["price"], signal["sl_price"],
+            stake, multiplier, signal.get("detail","")
+        )
+        trade_result = f"📄 _Paper trade simulado — ${stake} x{multiplier}_"
+
+    # ── MODO REAL ─────────────────────────────────────────────
     else:
-        contract_id, error = await open_trade(ws, symbol, direction, stake, multiplier, signal["sl_price"], config)
-        if error:
-            # Cooldown de 10 minutos tras cualquier error
-            signal_cooldown[symbol] = int(datetime.now(timezone.utc).timestamp()) + 600
-            if "rate limit" in error.lower():
-                # Rate limit — no spamear Telegram, solo loguear
-                print(f"[rate limit] {symbol} — pausado 10 min")
-                return
-            trade_result = f"❌ _Error: {error}_"
-        else:
+        open_count = await get_open_contract_count()
+        if open_count >= MAX_OPEN_CONTRACTS:
             trade_result = (
-                f"✅ *OPERACION ABIERTA*\n"
-                f"Stake: *${stake}* | x{multiplier}\n"
-                f"Contrato: `{contract_id}`\n"
-                f"SL inicial: ${round(stake*0.5,2)} (auto)\n"
-                f"Trailing: _{trailing_desc}_\n"
-                f"_Etapas: BE@1R → Trailing@2R → Agresivo@3R_"
+                f"⏸ _Slots llenos ({open_count}/{MAX_OPEN_CONTRACTS})_\n"
+                f"_Podés entrar manual si te convence_"
             )
+        else:
+            contract_id, error = await open_trade(ws, symbol, direction, stake, multiplier, signal["sl_price"], config)
+            if error:
+                signal_cooldown[symbol] = int(datetime.now(timezone.utc).timestamp()) + 600
+                if "rate limit" in error.lower():
+                    print(f"[rate limit] {symbol} — pausado 10 min")
+                    return
+                if "not offered" in error.lower() or "not available" in error.lower():
+                    assets_blocked.add(symbol)
+                    await send_telegram(f"⚠️ *{config['name']}* no disponible\nIgnorado hasta reinicio.")
+                    return
+                trade_result = f"❌ _Error: {error}_"
+            else:
+                trade_result = (
+                    f"✅ *OPERACION ABIERTA*\n"
+                    f"Stake: *${stake}* | x{multiplier}\n"
+                    f"Contrato: `{contract_id}`\n"
+                    f"SL inicial: ${round(stake*0.5,2)} (auto)\n"
+                    f"Trailing: _{trailing_desc}_\n"
+                    f"_Etapas: BE@1R → Trailing@2R → Agresivo@3R_"
+                )
 
     msg = (
         f"{d_emoji} *SENAL — {config['name']}*\n"
@@ -762,6 +799,9 @@ async def main():
                     continue
                 if "pong" in msg:
                     continue
+
+                # Dashboard diario a las 21:00 UTC
+                await shared.check_and_send_dashboard(account_balance)
                 if msg.get("error"):
                     err = msg["error"]
                     if err.get("code") not in ("AlreadySubscribed", "MarketIsClosed"):
