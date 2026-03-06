@@ -97,6 +97,18 @@ async def send_telegram(message: str):
         print(f"[Telegram error] {e}")
 
 # ─────────────────────────────────────────────
+# KEEPALIVE — evita desconexiones por inactividad
+# ─────────────────────────────────────────────
+async def keepalive(ws):
+    """Ping cada 30s para mantener el WS vivo. Deriv responde con pong."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            await ws.send(json.dumps({"ping": 1}))
+        except Exception:
+            break  # WS cerrado — task termina sola
+
+# ─────────────────────────────────────────────
 # UTILS
 # ─────────────────────────────────────────────
 def in_session(name: str) -> bool:
@@ -678,6 +690,9 @@ async def main():
         account_balance  = float(bal.get("balance", 0))
         print(f"Autenticado | Balance: {account_balance} {account_currency}\n")
 
+        # Lanzar keepalive para evitar desconexiones por inactividad
+        keepalive_task = asyncio.create_task(keepalive(ws))
+
         # Suscribir TF principal + H1 para inertia filter
         for symbol, config in ASSETS.items():
             # TF principal de la estrategia
@@ -713,7 +728,9 @@ async def main():
                 raw = await ws.recv()
                 msg = json.loads(raw)
                 mt  = msg.get("msg_type", "")
-                if mt in ("buy", "portfolio", "proposal_open_contract"):
+                if mt in ("buy", "portfolio", "proposal_open_contract", "ping"):
+                    continue
+                if "pong" in msg:
                     continue
                 if msg.get("error"):
                     err = msg["error"]
@@ -724,6 +741,7 @@ async def main():
 
             except websockets.exceptions.ConnectionClosed as e:
                 print(f"[WS] Conexion cerrada ({e.code}) — reconectando en 3s...")
+                keepalive_task.cancel()
                 await asyncio.sleep(3)
                 break
 
