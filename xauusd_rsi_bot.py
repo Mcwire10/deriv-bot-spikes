@@ -12,6 +12,7 @@ import aiohttp
 import numpy as np
 from datetime import datetime, timezone
 from collections import deque
+import shared
 
 # ══════════════════════════════════════════
 #  CONFIGURACIÓN Y CREDENCIALES
@@ -34,9 +35,8 @@ SESIONES = {
     "ny":      {"start": 13, "end": 20, "trailing": True,  "tp_ratio": None},
 }
 
-META_DIARIA      = 20.00
-STOP_LOSS_DIARIO = -10.00
 SALDO_MINIMO     = 5.00
+# META_DIARIA y STOP_LOSS_DIARIO vienen de shared.py (env vars)
 
 TZ_UTC = timezone.utc
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -73,17 +73,8 @@ async def enviar_telegram(msg):
 
 
 def reset_diario():
-    global profit_dia, trades_ganados, trades_perdidos, bot_pausado, fecha_actual
-    hoy = datetime.now(TZ_UTC).date()
-    if hoy != fecha_actual:
-        asyncio.create_task(enviar_telegram(
-            f"🌅 Nuevo día. Reseteando métricas.\nProfit ayer: *${round(profit_dia, 2)}*"
-        ))
-        profit_dia = 0.0
-        trades_ganados = trades_perdidos = 0
-        bot_pausado = False
-        contratos_vistos.clear()
-        fecha_actual = hoy
+    shared.reset_diario_si_corresponde()
+    contratos_vistos.clear()
 
 
 def sesion_activa():
@@ -362,6 +353,10 @@ async def deriv_bot():
                     if raw.get("msg_type") == "ping" or "pong" in raw:
                         continue
 
+                    # Dashboard diario a las 21:00 UTC
+                    if balance_actual:
+                        await shared.check_and_send_dashboard(balance_actual)
+
                     # ── VELAS HISTÓRICAS ──
                     if "candles" in raw:
                         velas = [
@@ -418,10 +413,28 @@ async def deriv_bot():
                         # Evaluar señal solo en cierre de vela
                         if len(velas) > 2 and velas[-2]["epoch"] != vela_procesada_epoch:
                             vela_procesada_epoch = velas[-2]["epoch"]
+
+                            # Check noticias antes de operar
+                            bloqueado, razon = await shared.check_news_filter(SYMBOL)
+                            if bloqueado:
+                                print(f"[news block] {razon}")
+                                continue
+
+                            # Check balance diario compartido
+                            if shared.is_pausado():
+                                continue
+
                             velas_cerradas = velas[:-1]
                             señal = evaluar_señal(velas_cerradas)
                             if señal:
-                                await calcular_sizing_y_enviar(ws, señal, sesion)
+                                if shared.is_paper_mode():
+                                    await shared.notify_paper_signal(
+                                        "GoldBot", SYMBOL, señal["dir"],
+                                        "SMC", señal["entry"], señal["sl_precio"],
+                                        STAKE_MINIMO, MULTIPLIER
+                                    )
+                                else:
+                                    await calcular_sizing_y_enviar(ws, señal, sesion)
 
                     # ── CONFIRMAR COMPRA ──
                     if "buy" in raw and "contract_id" in raw.get("buy", {}):
@@ -448,31 +461,26 @@ async def deriv_bot():
                                              else round(balance_actual + profit, 2))
                             profit_dia += profit
 
-                            if profit > 0:
-                                trades_ganados += 1
-                                resultado = f"🔥 WIN +${round(profit, 2)}"
-                            else:
-                                trades_perdidos += 1
-                                resultado = f"❌ LOSS -${abs(round(profit, 2))}"
+                            # Registrar en shared (balance diario compartido)
+                            shared.registrar_trade(
+                                "GoldBot", SYMBOL,
+                                ultimo_ctx.get("direction", "?"),
+                                profit, ultimo_ctx.get("stake", 0),
+                                ultimo_ctx.get("entry_price", 0), 0
+                            )
 
-                            total = trades_ganados + trades_perdidos
-                            wr    = round(trades_ganados / total * 100, 1) if total else 0
+                            stats  = shared.get_stats()
+                            emoji  = "🔥" if profit > 0 else "❌"
+                            signo  = "+" if profit > 0 else ""
                             resumen = (
-                                f"{resultado}\n"
+                                f"{emoji} *{'WIN' if profit > 0 else 'LOSS'} {signo}${round(profit,2)}*\n"
                                 f"📊 XAU/USD {ultimo_ctx.get('direction','?')} x{MULTIPLIER}\n"
                                 f"💵 Saldo: ${balance_actual} {moneda}\n"
-                                f"📈 Día: ${round(profit_dia,2)} / ${META_DIARIA}\n"
-                                f"🎯 WR: {wr}% ({trades_ganados}G/{trades_perdidos}P)"
+                                f"📈 Día: ${stats['profit']} / ${shared.META_DIARIA}\n"
+                                f"🎯 WR: {stats['wr']}% ({stats['ganados']}G/{stats['perdidos']}P)"
                             )
-                            print(resumen.replace('\n', ' | '))
+                            print(resumen.replace("\n", " | "))
                             await enviar_telegram(resumen)
-
-                            if profit_dia >= META_DIARIA:
-                                await enviar_telegram(f"🏆 META DIARIA! +${round(profit_dia,2)}")
-                                bot_pausado = True
-                            elif profit_dia <= STOP_LOSS_DIARIO:
-                                await enviar_telegram(f"🛡️ STOP LOSS DIARIO (${round(profit_dia,2)})")
-                                bot_pausado = True
 
                         # Recuperar trade tras reinicio
                         elif (contract.get("underlying") == SYMBOL
