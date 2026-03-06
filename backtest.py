@@ -315,10 +315,20 @@ def strat_rsi_divergence(candles, config):
 # SIMULACION TRAILING 3 ETAPAS
 # ─────────────────────────────────────────────
 def simulate_trade(candles_after, direction, entry, sl_price, stake, multiplier):
+    """
+    Trailing optimizado — 4 etapas para capturar más en winners:
+      Etapa 0 (<1R):  SL fijo — dejar respirar
+      Etapa 1 (>=1R): Break-even + buffer 0.3 ATR — protege sin cortar
+      Etapa 2 (>=2R): ATR 1.5x desde entry — da espacio en moves medianos
+      Etapa 3 (>=3R): Low/High vela anterior — trailing activo
+      Etapa 4 (>=5R): Body vela anterior — máxima captura en moves grandes
+    """
     sl_dist = abs(entry - sl_price)
     if sl_dist == 0:
         return {"profit": 0, "r": 0, "candles": 0, "reason": "invalid_sl"}
 
+    # ATR estimado como el SL distance (proxy razonable)
+    atr_est    = sl_dist / 0.3  # el SL se puso a 0.3 ATR del swing
     current_sl = sl_price
     stage      = 0
 
@@ -332,18 +342,33 @@ def simulate_trade(candles_after, direction, entry, sl_price, stake, multiplier)
 
         pts   = (c["close"] - entry) if direction == "LONG" else (entry - c["close"])
         r_now = pts / sl_dist
-        new_s = 3 if r_now >= 3 else (2 if r_now >= 2 else (1 if r_now >= 1 else 0))
+        new_s = 4 if r_now >= 5 else (3 if r_now >= 3 else (2 if r_now >= 2 else (1 if r_now >= 1 else 0)))
         if new_s > stage: stage = new_s
 
         if stage == 1:
-            if direction == "LONG"  and entry > current_sl: current_sl = entry
-            if direction == "SHORT" and entry < current_sl: current_sl = entry
-        elif stage >= 2 and i >= 1:
+            # Break-even + pequeño buffer para no salir en el ruido
+            be = entry + atr_est * 0.3 if direction == "LONG" else entry - atr_est * 0.3
+            if direction == "LONG"  and be > current_sl: current_sl = be
+            if direction == "SHORT" and be < current_sl: current_sl = be
+
+        elif stage == 2:
+            # ATR 1.5x desde entry — da espacio sin cortar el trade
+            trail = entry + atr_est * 1.5 if direction == "LONG" else entry - atr_est * 1.5
+            if direction == "LONG"  and trail > current_sl: current_sl = trail
+            if direction == "SHORT" and trail < current_sl: current_sl = trail
+
+        elif stage == 3 and i >= 1:
+            # Low/High de vela anterior — trailing activo
             prev = candles_after[i-1]
-            if direction == "LONG":
-                if prev["low"] > current_sl: current_sl = prev["low"]
-            else:
-                if prev["high"] < current_sl: current_sl = prev["high"]
+            if direction == "LONG"  and prev["low"]  > current_sl: current_sl = prev["low"]
+            if direction == "SHORT" and prev["high"] < current_sl: current_sl = prev["high"]
+
+        elif stage == 4 and i >= 1:
+            # Body de vela anterior — máxima captura
+            prev  = candles_after[i-1]
+            body_sl = min(prev["open"], prev["close"]) if direction == "LONG" else max(prev["open"], prev["close"])
+            if direction == "LONG"  and body_sl > current_sl: current_sl = body_sl
+            if direction == "SHORT" and body_sl < current_sl: current_sl = body_sl
 
     ep     = candles_after[min(199, len(candles_after)-1)]["close"]
     delta  = (ep - entry) / entry * (1 if direction == "LONG" else -1)
