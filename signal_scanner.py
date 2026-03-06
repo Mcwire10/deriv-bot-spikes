@@ -35,40 +35,46 @@ FOREX_EXPOSURE = {
 }
 
 # ─────────────────────────────────────────────
-# ASSETS — 3 activos de mayor score/confianza
+# ASSETS — validados por backtesting 12 meses
+# GBP/USD: PF 1.71x WR 51% | GBP/JPY: PF 1.93x | Silver: PF 1.89x
+# EUR/USD y US500 descartados (sin edge confirmado)
 # ─────────────────────────────────────────────
 ASSETS = {
-    # EUR/USD — London SMC, confianza 85%
-    "frxEURUSD": {
-        "name": "EUR/USD", "granularity": 900,
-        "strategy": "smart_money_mss", "session": "london_open",
-        "trailing_mode": "candle", "trailing_after_r": 0.0,
+    "frxGBPUSD": {
+        "name": "GBP/USD", "symbol": "frxGBPUSD", "granularity": 900,
+        "strategy": "rsi_divergence", "session": "london_open",
+        "trailing_mode": "optimized", "trailing_after_r": 0.0,
         "first_signal_only": True, "confidence": 85,
-        "use_h1_inertia": True,
+        "use_h1_inertia": False,
+        "rsi_period": 14, "impulse_candles": 4,
+        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
     },
-    # GBP/JPY — Asia/Londres overlap, confianza 80%
     "frxGBPJPY": {
-        "name": "GBP/JPY", "granularity": 1800,
-        "strategy": "ema_structure_trend", "session": "asia_london_overlap",
-        "trailing_mode": "atr", "trailing_atr_mult": 1.5, "trailing_after_r": 0.0,
+        "name": "GBP/JPY", "symbol": "frxGBPJPY", "granularity": 1800,
+        "strategy": "rsi_divergence", "session": "asia_london",
+        "trailing_mode": "optimized", "trailing_after_r": 0.0,
         "first_signal_only": True, "confidence": 80,
-        "use_h1_inertia": True,
+        "use_h1_inertia": False,
+        "rsi_period": 14, "impulse_candles": 4,
+        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
     },
-    # US500 — Wall Street SMC, confianza 90%
-    "OTC_SPC": {
-        "name": "US 500", "granularity": 300,
-        "strategy": "smart_money_mss", "session": "wallstreet",
-        "trailing_mode": "atr", "trailing_atr_mult": 2.0, "trailing_after_r": 0.0,
-        "first_signal_only": True, "confidence": 90,
-        "use_h1_inertia": True,
+    "frxXAGUSD": {
+        "name": "Silver XAG/USD", "symbol": "frxXAGUSD", "granularity": 900,
+        "strategy": "rsi_divergence", "session": "ny_open",
+        "trailing_mode": "optimized", "trailing_after_r": 0.0,
+        "first_signal_only": True, "confidence": 85,
+        "use_h1_inertia": False,
+        "rsi_period": 14, "impulse_candles": 4,
+        "spike_mult": 3.0, "spike_lookback": 20, "max_points": 20,
     },
 }
 
 SESSIONS = {
-    "london_open":         (8,  12),
-    "asia_london_overlap": (6,  9),
-    "wallstreet":          (16, 21),  # Wall Street abre 16:30 UTC, margen de seguridad
-    "all":                 (0,  24),
+    "london_open":  (8,  12),
+    "asia_london":  (6,  9),
+    "ny_open":      (13, 17),
+    "wallstreet":   (16, 21),
+    "all":          (0,  24),
 }
 
 # ─────────────────────────────────────────────
@@ -154,6 +160,10 @@ def calc_rsi(closes, period=14):
     al = np.mean(np.where(d < 0, -d, 0.0)[-period:])
     if al == 0: return 100.0
     return float(100 - 100 / (1 + ag / al))
+
+def avg_body(candles, period=20):
+    if len(candles) < period: return 0
+    return float(np.mean([abs(c["close"] - c["open"]) for c in candles[-period:]]))
 
 def detect_rsi_divergence(candles, rsi_period=14, lookback=5):
     if len(candles) < rsi_period + lookback + 2: return None
@@ -241,21 +251,128 @@ def run_strategy(symbol, config, candles):
     s = config.get("strategy")
     if s == "smart_money_mss":    return strat_smart_money_mss(symbol, config, candles)
     if s == "ema_structure_trend": return strat_ema_struct(symbol, config, candles)
+    if s == "rsi_divergence":      return strat_rsi_divergence(symbol, config, candles)
+    return None
+
+def strat_rsi_divergence(symbol, config, candles):
+    """
+    RSI Divergencias — replica exacta del gold bot original (+48R backtestado).
+    Validado: GBP/USD PF 1.71x | GBP/JPY PF 1.93x | Silver PF 1.89x (12 meses)
+    """
+    rsi_period  = config.get("rsi_period", 14)
+    imp_candles = config.get("impulse_candles", 4)
+    spike_mult  = config.get("spike_mult", 3.0)
+    spike_lb    = config.get("spike_lookback", 20)
+    max_pts     = config.get("max_points", 20)
+
+    if len(candles) < rsi_period + imp_candles + max_pts + 10: return None
+
+    closes = [c["close"] for c in candles]
+    lows   = [c["low"]   for c in candles]
+    highs  = [c["high"]  for c in candles]
+    ultima = candles[-1]
+
+    # Filtro anti-spike
+    if len(candles) >= spike_lb:
+        ab   = avg_body(candles[-(spike_lb+1):-1], spike_lb)
+        body = abs(ultima["close"] - ultima["open"])
+        if ab > 0 and body > ab * spike_mult:
+            return None
+
+    # RSI deslizante
+    rsi_vals = [None] * len(candles)
+    for i in range(rsi_period, len(candles)):
+        rsi_vals[i] = calc_rsi(closes[max(0, i - rsi_period * 2):i + 1], rsi_period)
+
+    n = len(candles)
+
+    # BULLISH: 4+ velas bajistas → P1 mínimo → P2 mínimo menor con RSI mayor
+    for p1 in range(n - max_pts - 2, n - 3):
+        if p1 < imp_candles + rsi_period: continue
+        if not all(candles[p1-k-1]["close"] < candles[p1-k-1]["open"] for k in range(imp_candles)):
+            continue
+        p1_low = lows[p1]
+        p1_rsi = rsi_vals[p1]
+        if p1_rsi is None: continue
+
+        for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
+            between = [r for r in rsi_vals[p1+1:p2] if r is not None]
+            if any(r >= 50 for r in between): break
+
+            p2_low = lows[p2]
+            p2_rsi = rsi_vals[p2]
+            if p2_rsi is None: continue
+
+            if p2_low < p1_low and p2_rsi > p1_rsi and p2 == n - 2:
+                atr = calc_atr(candles[:p2+1])
+                if not atr: continue
+                return {
+                    "direction": "LONG",
+                    "strategy":  "RSI Bullish Divergence",
+                    "price":     ultima["close"],
+                    "sl_price":  round(p2_low - atr * 0.3, 5),
+                    "detail":    f"P1:{round(p1_low,4)} RSI:{round(p1_rsi,1)} → P2:{round(p2_low,4)} RSI:{round(p2_rsi,1)}",
+                    "rsi":       round(p2_rsi, 1),
+                }
+
+    # BEARISH: 4+ velas alcistas → P1 máximo → P2 máximo mayor con RSI menor
+    for p1 in range(n - max_pts - 2, n - 3):
+        if p1 < imp_candles + rsi_period: continue
+        if not all(candles[p1-k-1]["close"] > candles[p1-k-1]["open"] for k in range(imp_candles)):
+            continue
+        p1_high = highs[p1]
+        p1_rsi  = rsi_vals[p1]
+        if p1_rsi is None: continue
+
+        for p2 in range(p1 + 2, min(p1 + max_pts + 1, n - 1)):
+            between = [r for r in rsi_vals[p1+1:p2] if r is not None]
+            if any(r <= 50 for r in between): break
+
+            p2_high = highs[p2]
+            p2_rsi  = rsi_vals[p2]
+            if p2_rsi is None: continue
+
+            if p2_high > p1_high and p2_rsi < p1_rsi and p2 == n - 2:
+                atr = calc_atr(candles[:p2+1])
+                if not atr: continue
+                return {
+                    "direction": "SHORT",
+                    "strategy":  "RSI Bearish Divergence",
+                    "price":     ultima["close"],
+                    "sl_price":  round(p2_high + atr * 0.3, 5),
+                    "detail":    f"P1:{round(p1_high,4)} RSI:{round(p1_rsi,1)} → P2:{round(p2_high,4)} RSI:{round(p2_rsi,1)}",
+                    "rsi":       round(p2_rsi, 1),
+                }
+
     return None
 
 # ── Smart Money Concepts — MSS + Fibonacci zones (del v7) ────────
 def strat_smart_money_mss(symbol, config, candles):
     """
-    1. Detecta Swing Highs y Swing Lows (fractales de 5 velas)
-    2. Identifica quiebre de estructura (MSS)
-    3. Espera retest en zona Premium (SHORT) o Discount (LONG) 61.8%-78.6% Fibonacci
+    SMC mejorado v2 — mismos filtros validados en backtesting:
+    - Rango minimo 2x ATR (elimina rangos de ruido)
+    - RSI confirma zona (>60 SHORT, <40 LONG)
+    - Trigger con cuerpo fuerte (>1.5x promedio)
+    - US500: no entrar en primeros 15 min de apertura
     """
     if len(candles) < 50: return None
 
-    atr = calc_atr(candles)
+    atr    = calc_atr(candles)
     if not atr: return None
 
-    # Detectar fractales (swing highs y lows con ventana de 2 velas cada lado)
+    closes  = [c["close"] for c in candles]
+    rsi     = calc_rsi(closes)
+    avg_b   = avg_body(candles)
+    ultima  = candles[-1]
+    previa  = candles[-2]
+
+    # Filtro apertura US500
+    if symbol == "OTC_SPC":
+        dt = datetime.now(timezone.utc)
+        if dt.hour == 16 and dt.minute < 15:
+            return None
+
+    # Detectar fractales
     swing_highs, swing_lows = [], []
     for i in range(2, len(candles) - 2):
         c = candles[i]
@@ -270,63 +387,85 @@ def strat_smart_money_mss(symbol, config, candles):
 
     last_sh = swing_highs[-1]["price"]
     last_sl = swing_lows[-1]["price"]
-    curr    = candles[-1]["close"]
+    curr    = ultima["close"]
     rango   = last_sh - last_sl
 
-    if rango <= 0: return None
+    # Rango minimo 2x ATR
+    if rango < atr * 2 or rango <= 0: return None
 
-    # ── ESCENARIO BAJISTA — retest en zona Premium ────────────────
-    # Precio rompió el ultimo Swing Low (MSS bajista) y retrocede hacia arriba
-    fib_618_bear = last_sh - (rango * 0.382)   # 61.8% desde el High
-    fib_786_bear = last_sh - (rango * 0.214)   # 78.6% desde el High
-    if fib_618_bear <= curr <= fib_786_bear:
+    # Trigger con cuerpo fuerte
+    trigger_body  = abs(ultima["close"] - ultima["open"])
+    strong_candle = trigger_body > avg_b * 1.5 if avg_b > 0 else True
+    trigger_bear  = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"] and strong_candle
+    trigger_bull  = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"] and strong_candle
+
+    # SHORT — zona Premium + RSI > 60
+    fib_618_bear = last_sh - (rango * 0.382)
+    fib_786_bear = last_sh - (rango * 0.214)
+    rsi_bear_ok  = rsi is None or rsi > 60
+    if fib_618_bear <= curr <= fib_786_bear and trigger_bear and rsi_bear_ok:
         return {
             "direction": "SHORT",
-            "strategy":  "SMC Premium Zone",
+            "strategy":  "SMC Premium Zone v2",
             "price":     curr,
             "sl_price":  round(last_sh + atr * 0.5, 5),
-            "detail":    f"Retest zona Premium 61.8% | SH: {round(last_sh,4)} | SL: {round(last_sl,4)} | Fib: {round(fib_618_bear,4)}-{round(fib_786_bear,4)}",
-            "rsi":       None,
+            "detail":    f"Retest Premium 61.8% | RSI:{round(rsi,1) if rsi else '?'} | SH:{round(last_sh,4)} | Fib:{round(fib_618_bear,4)}-{round(fib_786_bear,4)}",
+            "rsi":       round(rsi, 1) if rsi else None,
         }
 
-    # ── ESCENARIO ALCISTA — retest en zona Discount ───────────────
-    # Precio rompió el ultimo Swing High (MSS alcista) y retrocede hacia abajo
-    fib_618_bull = last_sl + (rango * 0.382)   # 61.8% desde el Low
-    fib_786_bull = last_sl + (rango * 0.214)   # 78.6% desde el Low
-    if fib_786_bull <= curr <= fib_618_bull:
+    # LONG — zona Discount + RSI < 40
+    fib_618_bull = last_sl + (rango * 0.382)
+    fib_786_bull = last_sl + (rango * 0.214)
+    rsi_bull_ok  = rsi is None or rsi < 40
+    if fib_786_bull <= curr <= fib_618_bull and trigger_bull and rsi_bull_ok:
         return {
             "direction": "LONG",
-            "strategy":  "SMC Discount Zone",
+            "strategy":  "SMC Discount Zone v2",
             "price":     curr,
             "sl_price":  round(last_sl - atr * 0.5, 5),
-            "detail":    f"Retest zona Discount 61.8% | SH: {round(last_sh,4)} | SL: {round(last_sl,4)} | Fib: {round(fib_786_bull,4)}-{round(fib_618_bull,4)}",
-            "rsi":       None,
+            "detail":    f"Retest Discount 61.8% | RSI:{round(rsi,1) if rsi else '?'} | SL:{round(last_sl,4)} | Fib:{round(fib_786_bull,4)}-{round(fib_618_bull,4)}",
+            "rsi":       round(rsi, 1) if rsi else None,
         }
 
     return None
 
 # ── EMA Structure Trend — GBP/JPY ────────────────────────────────
 def strat_ema_struct(symbol, config, candles):
+    """
+    EMA 50/200 Golden/Death Cross — validado en backtesting.
+    Filtros: RSI momentum + precio del lado correcto de EMA200.
+    """
     closes = [c["close"] for c in candles]
-    if len(closes) < 26: return None
-    e9  = calc_ema(closes, 9)
-    e21 = calc_ema(closes, 21)
-    atr = calc_atr(candles, 14)
-    rsi = calc_rsi(closes)
+    if len(closes) < 210: return None
+    e50  = calc_ema(closes, 50)
+    e200 = calc_ema(closes, 200)
+    atr  = calc_atr(candles, 14)
+    rsi  = calc_rsi(closes)
     curr = candles[-1]["close"]
     mult = config.get("trailing_atr_mult", 1.5)
-    if e9[-2] <= e21[-2] and e9[-1] > e21[-1]:
-        return {"direction": "LONG", "strategy": "EMA Cross", "price": curr,
-                "rsi": round(rsi,2) if rsi else None,
-                "sl_price": round(curr-(atr*mult),3) if atr else round(e21[-1],3),
-                "detail": f"EMA9 cruzo sobre EMA21 | Tokyo→Londres | RSI {round(rsi,1) if rsi else '?'}",
-                "warning": "Riesgo BoJ"}
-    if e9[-2] >= e21[-2] and e9[-1] < e21[-1]:
-        return {"direction": "SHORT", "strategy": "EMA Cross", "price": curr,
-                "rsi": round(rsi,2) if rsi else None,
-                "sl_price": round(curr+(atr*mult),3) if atr else round(e21[-1],3),
-                "detail": f"EMA9 cruzo bajo EMA21 | Tokyo→Londres | RSI {round(rsi,1) if rsi else '?'}",
-                "warning": "Riesgo BoJ"}
+    if not atr or len(e50) < 2 or len(e200) < 2: return None
+
+    # Golden Cross — EMA50 cruza sobre EMA200
+    if (e50[-2] <= e200[-2] and e50[-1] > e200[-1]
+            and curr > e200[-1]
+            and (rsi is None or rsi > 50)):
+        return {
+            "direction": "LONG", "strategy": "Golden Cross 50/200",
+            "price": curr, "rsi": round(rsi,1) if rsi else None,
+            "sl_price": round(curr - atr * mult, 3),
+            "detail": f"EMA50 cruzo sobre EMA200 | RSI:{round(rsi,1) if rsi else '?'} | precio > EMA200",
+        }
+
+    # Death Cross — EMA50 cruza bajo EMA200
+    if (e50[-2] >= e200[-2] and e50[-1] < e200[-1]
+            and curr < e200[-1]
+            and (rsi is None or rsi < 50)):
+        return {
+            "direction": "SHORT", "strategy": "Death Cross 50/200",
+            "price": curr, "rsi": round(rsi,1) if rsi else None,
+            "sl_price": round(curr + atr * mult, 3),
+            "detail": f"EMA50 cruzo bajo EMA200 | RSI:{round(rsi,1) if rsi else '?'} | precio < EMA200",
+        }
     return None
 
 # ─────────────────────────────────────────────
@@ -355,7 +494,8 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
     last_epoch       = None
     stage            = 0
 
-    stage_names = ["Inicial", "Break-even 🔒", "Trailing vela 📈", "Trailing agresivo 🚀"]
+    stage_names = ["Inicial", "Break-even 🔒", "ATR Trail 📊", "Trailing vela 📈", "Trailing agresivo 🚀"]
+    atr_est     = abs(entry_price - initial_sl_price) / 0.3  # ATR estimado desde SL estructural
 
     def calc_profit_r(curr_price):
         dist = abs(entry_price - initial_sl_price)
@@ -393,7 +533,7 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                             f"{'💚' if profit >= 0 else '🔴'} *CONTRATO CERRADO*\n"
                             f"Activo: {ctx['name']} | {direction}\n"
                             f"Resultado: *${round(profit, 2)}*\n"
-                            f"Etapa al cierre: _{stage_names[min(stage,3)]}_\n"
+                            f"Etapa al cierre: _{stage_names[min(stage,4)]}_\n"
                             f"Día: ${stats['profit']} | WR: {stats['wr']}%"
                         )
                         print(f"[trailing] {contract_id} cerrado | profit:${profit}")
@@ -414,42 +554,41 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                 profit_r   = calc_profit_r(curr_price)
 
                 # Subir de etapa segun profit
-                new_stage = 3 if profit_r >= 3.0 else (2 if profit_r >= 2.0 else (1 if profit_r >= 1.0 else 0))
+                new_stage = 4 if profit_r >= 5.0 else (3 if profit_r >= 3.0 else (2 if profit_r >= 2.0 else (1 if profit_r >= 1.0 else 0)))
                 if new_stage > stage:
                     stage = new_stage
-                    print(f"[trailing] {contract_id} — ETAPA {stage}: {stage_names[stage]} ({round(profit_r,2)}R)")
+                    print(f"[trailing] {contract_id} — ETAPA {stage}: {stage_names[min(stage,4)]} ({round(profit_r,2)}R)")
                     await send_telegram(
                         f"📊 *TRAILING UPDATE — {ctx['name']}*\n"
                         f"Contrato: `{contract_id}` | {direction}\n"
                         f"Profit: *{round(profit_r,2)}R*\n"
-                        f"Nueva etapa: _{stage_names[stage]}_"
+                        f"Nueva etapa: _{stage_names[min(stage,4)]}_"
                     )
 
                 if stage == 0: continue
 
-                # ── Calcular nuevo SL ─────────────────────────────────
+                # ── Calcular nuevo SL — trailing optimizado ───────────
                 new_sl = None
 
-                if stage == 1:   # Break-even
-                    if direction == "LONG"  and entry_price > current_sl_price: new_sl = entry_price
-                    if direction == "SHORT" and entry_price < current_sl_price: new_sl = entry_price
+                if stage == 1:   # Break-even + buffer 0.3 ATR
+                    be = round(entry_price + atr_est * 0.3, 5) if direction == "LONG" else round(entry_price - atr_est * 0.3, 5)
+                    if direction == "LONG"  and be > current_sl_price: new_sl = be
+                    if direction == "SHORT" and be < current_sl_price: new_sl = be
 
-                elif stage == 2:  # Trailing segun modo
-                    if trailing_mode == "atr":
-                        atr = calc_atr(store)
-                        if atr:
-                            c = round(curr_price - atr*atr_mult, 5) if direction == "LONG" else round(curr_price + atr*atr_mult, 5)
-                            if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
-                                new_sl = c
-                    else:  # candle
-                        c = prev_c["low"] if direction == "LONG" else prev_c["high"]
-                        if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
-                            new_sl = c
+                elif stage == 2:  # ATR 1.5x desde entry — espacio en moves medianos
+                    trail = round(entry_price + atr_est * 1.5, 5) if direction == "LONG" else round(entry_price - atr_est * 1.5, 5)
+                    if direction == "LONG"  and trail > current_sl_price: new_sl = trail
+                    if direction == "SHORT" and trail < current_sl_price: new_sl = trail
 
-                elif stage == 3:  # Agresivo — body de vela anterior
+                elif stage == 3:  # Low/High vela anterior — trailing activo
+                    c = prev_c["low"] if direction == "LONG" else prev_c["high"]
+                    if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
+                        new_sl = round(c, 5)
+
+                elif stage == 4:  # Body vela anterior — maxima captura
                     c = min(prev_c["open"], prev_c["close"]) if direction == "LONG" else max(prev_c["open"], prev_c["close"])
                     if (direction == "LONG" and c > current_sl_price) or (direction == "SHORT" and c < current_sl_price):
-                        new_sl = c
+                        new_sl = round(c, 5)
 
                 if new_sl is None: continue
 
