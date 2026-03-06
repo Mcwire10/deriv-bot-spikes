@@ -488,7 +488,11 @@ async def get_open_contract_count() -> int:
 # ABRIR TRADE (del v5 + multiplier dinamico del v7)
 # ─────────────────────────────────────────────
 async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config):
-    sl_amount = round(stake * 0.5, 2)
+    """
+    Abre el contrato SIN limit_order para evitar errores de validacion.
+    Inmediatamente despues aplica el SL via contract_update.
+    Este es el mismo flujo que usa el gold bot v9.
+    """
     req = {
         "buy": 1, "price": stake,
         "parameters": {
@@ -498,9 +502,6 @@ async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config)
             "multiplier": multiplier,
             "product_type": "basic",
             "symbol": symbol,
-            "limit_order": {
-                "stop_loss": {"order_type": "stop_loss", "order_amount": sl_amount}
-            }
         }
     }
     await ws.send(json.dumps(req))
@@ -514,6 +515,20 @@ async def open_trade(ws, symbol, direction, stake, multiplier, sl_price, config)
                 buy_data    = msg["buy"]
                 contract_id = buy_data["contract_id"]
                 buy_price   = float(buy_data["buy_price"])
+
+                # Aplicar SL via contract_update (mas compatible que limit_order en buy)
+                sl_amount = calc_sl_amount(buy_price, buy_price, sl_price, direction, multiplier)
+                try:
+                    await ws.send(json.dumps({
+                        "contract_update": 1,
+                        "contract_id": contract_id,
+                        "limit_order": {
+                            "stop_loss": {"order_type": "stop_loss", "order_amount": sl_amount}
+                        }
+                    }))
+                    print(f"[SL] Aplicado via contract_update | ${sl_amount}")
+                except Exception as e:
+                    print(f"[SL warning] No se pudo aplicar SL inicial: {e}")
 
                 ctx = {
                     "symbol":           symbol,
