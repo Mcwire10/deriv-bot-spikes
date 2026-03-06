@@ -100,10 +100,10 @@ async def send_telegram(message: str):
 # KEEPALIVE — evita desconexiones por inactividad
 # ─────────────────────────────────────────────
 async def keepalive(ws):
-    """Ping cada 30s para mantener el WS vivo. Deriv responde con pong."""
+    """Ping cada 20s para mantener el WS vivo. Deriv responde con pong."""
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
             await ws.send(json.dumps({"ping": 1}))
         except Exception:
             break  # WS cerrado — task termina sola
@@ -740,7 +740,7 @@ async def main():
 
         while True:
             try:
-                raw = await ws.recv()
+                raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 msg = json.loads(raw)
                 mt  = msg.get("msg_type", "")
                 if mt in ("buy", "portfolio", "proposal_open_contract", "ping"):
@@ -754,6 +754,11 @@ async def main():
                     continue
                 await process_message(ws, msg)
 
+            except asyncio.TimeoutError:
+                print("[WS] Timeout 60s sin datos — reconectando en 3s...")
+                keepalive_task.cancel()
+                await asyncio.sleep(3)
+                break
             except websockets.exceptions.ConnectionClosed as e:
                 print(f"[WS] Conexion cerrada ({e.code}) — reconectando en 3s...")
                 keepalive_task.cancel()
