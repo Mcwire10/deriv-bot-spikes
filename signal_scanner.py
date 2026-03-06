@@ -402,31 +402,39 @@ def calc_sl_amount(stake: float, entry_price: float, sl_price: float,
 # ─────────────────────────────────────────────
 async def trailing_stop_task(contract_id: int, ctx: dict):
     """
-    Task independiente por contrato.
-    Abre WS secundario, se suscribe al contrato, y ejecuta el trailing
-    vela a vela usando el monto dinamico correcto.
+    Task independiente por contrato — lógica de 3 etapas:
+      Etapa 0 — SL inicial fijo (esperando 1R)
+      Etapa 1 — profit >= 1R → mover SL a break-even (entry price)
+      Etapa 2 — profit >= 2R → trailing vela a vela (low/high de vela anterior)
+      Etapa 3 — profit >= 3R → trailing agresivo (body de vela anterior, no shadow)
+    Esto protege el capital primero y maximiza el profit en movimientos grandes.
     """
-    symbol         = ctx["symbol"]
-    direction      = ctx["direction"]
-    entry_price    = ctx["entry_price"]
-    stake          = ctx["stake"]
-    trailing_mode  = ctx["trailing_mode"]
-    atr_mult       = ctx.get("atr_mult", 2.0)
-    trailing_pct   = ctx.get("trailing_pct", 0.007)
-    after_r        = ctx.get("trailing_after_r", 0.0)
+    symbol           = ctx["symbol"]
+    direction        = ctx["direction"]
+    entry_price      = ctx["entry_price"]
+    stake            = ctx["stake"]
+    trailing_mode    = ctx["trailing_mode"]
+    atr_mult         = ctx.get("atr_mult", 2.0)
+    trailing_pct     = ctx.get("trailing_pct", 0.007)
     current_sl_price = ctx["initial_sl_price"]
-    last_epoch     = None
-    trailing_active = after_r == 0.0
+    initial_sl_price = ctx["initial_sl_price"]
+    last_epoch       = None
+    stage            = 0   # 0=inicial | 1=break-even | 2=trailing | 3=agresivo
 
-    print(f"[trailing] Iniciado | contrato {contract_id} | {symbol} {direction} | modo:{trailing_mode}")
+    print(f"[trailing] Iniciado | {contract_id} | {symbol} {direction} | modo:{trailing_mode}")
+
+    def calc_profit_r(curr_price: float) -> float:
+        sl_dist = abs(entry_price - initial_sl_price)
+        if sl_dist == 0: return 0.0
+        if direction == "LONG":
+            return (curr_price - entry_price) / sl_dist
+        return (entry_price - curr_price) / sl_dist
 
     try:
         async with websockets.connect(DERIV_WS_URL) as ws_t:
-            # Autenticar WS secundario
             await ws_t.send(json.dumps({"authorize": DERIV_API_TOKEN}))
             await ws_t.recv()
 
-            # FIX 3: suscribirse al contrato para detectar cierre
             await ws_t.send(json.dumps({
                 "proposal_open_contract": 1,
                 "contract_id": contract_id,
@@ -437,29 +445,32 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                 msg = json.loads(raw)
                 mt  = msg.get("msg_type")
 
-                # Detectar cierre del contrato
+                # ── Detectar cierre del contrato ──────────────────────
                 if mt == "proposal_open_contract":
                     poc = msg.get("proposal_open_contract", {})
 
                     if poc.get("status") in ("sold", "expired") or not poc.get("is_valid_to_sell", True):
-                        profit = poc.get("profit", 0)
-                        p_emoji = "💚" if profit >= 0 else "🔴"
+                        profit     = float(poc.get("profit", 0))
+                        p_emoji    = "💚" if profit >= 0 else "🔴"
+                        profit_r   = calc_profit_r(float(poc.get("current_spot", entry_price)))
+                        stage_desc = ["Inicial", "Break-even", "Trailing", "Agresivo"][min(stage, 3)]
                         active_contracts.pop(contract_id, None)
                         await send_telegram(
                             f"{p_emoji} *CONTRATO CERRADO*\n"
                             f"Activo: {ctx['name']} | {direction}\n"
-                            f"Resultado: *${round(float(profit),2)}*\n"
+                            f"Resultado: *${round(profit, 2)}*\n"
+                            f"Etapa trailing al cierre: _{stage_desc}_\n"
                             f"Contratos activos: {len(active_contracts)}"
                         )
-                        print(f"[trailing] Contrato {contract_id} cerrado | profit: {profit}")
+                        print(f"[trailing] {contract_id} cerrado | profit:${profit} | stage:{stage_desc}")
                         return
 
-                    # Actualizar entry_price real si no lo teniamos
+                    # Actualizar entry_price real desde la API
                     if entry_price <= 0:
                         entry_price = float(poc.get("buy_price", 0))
                         ctx["entry_price"] = entry_price
 
-                # Logica de trailing por vela nueva
+                # ── Logica por vela nueva ─────────────────────────────
                 store = candle_store.get(symbol, [])
                 if len(store) < 2:
                     continue
@@ -470,53 +481,86 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                     continue
                 last_epoch = prev_candle["epoch"]
 
-                # Verificar activacion de trailing (trailing_after_r)
-                if not trailing_active:
-                    curr_price = curr_candle["close"]
-                    sl_dist = abs(entry_price - current_sl_price)
-                    if sl_dist > 0:
-                        if direction == "LONG":
-                            profit_r = (curr_price - entry_price) / sl_dist
-                        else:
-                            profit_r = (entry_price - curr_price) / sl_dist
-                        if profit_r >= after_r:
-                            trailing_active = True
-                            print(f"[trailing] {contract_id} — trailing activado ({round(profit_r,2)}R)")
-                    continue
+                curr_price = curr_candle["close"]
+                profit_r   = calc_profit_r(curr_price)
 
-                # Calcular nuevo SL precio segun modo
+                # ── Determinar etapa segun profit actual ──────────────
+                new_stage = stage
+                if profit_r >= 3.0:
+                    new_stage = 3
+                elif profit_r >= 2.0:
+                    new_stage = 2
+                elif profit_r >= 1.0:
+                    new_stage = 1
+
+                if new_stage > stage:
+                    stage = new_stage
+                    stage_names = ["Inicial", "Break-even 🔒", "Trailing vela 📈", "Trailing agresivo 🚀"]
+                    print(f"[trailing] {contract_id} {symbol} — ETAPA {stage}: {stage_names[stage]} ({round(profit_r,2)}R)")
+                    await send_telegram(
+                        f"📊 *TRAILING UPDATE — {ctx['name']}*\n"
+                        f"Contrato: `{contract_id}` | {direction}\n"
+                        f"Profit actual: *{round(profit_r,2)}R*\n"
+                        f"Nueva etapa: _{stage_names[stage]}_"
+                    )
+
+                # ── Calcular nuevo SL segun etapa ─────────────────────
                 new_sl_price = None
 
-                if trailing_mode == "candle":
-                    if direction == "LONG":
-                        candidate = prev_candle["low"]
-                        if candidate > current_sl_price:
-                            new_sl_price = candidate
-                    else:
-                        candidate = prev_candle["high"]
-                        if candidate < current_sl_price:
-                            new_sl_price = candidate
+                if stage == 0:
+                    # Sin trailing todavia — SL fijo inicial
+                    continue
 
-                elif trailing_mode == "atr":
-                    atr = calc_atr(store)
-                    if atr:
+                elif stage == 1:
+                    # Break-even: mover SL a entry price
+                    if direction == "LONG" and entry_price > current_sl_price:
+                        new_sl_price = entry_price
+                    elif direction == "SHORT" and entry_price < current_sl_price:
+                        new_sl_price = entry_price
+
+                elif stage == 2:
+                    # Trailing vela a vela — low/high de vela anterior
+                    if trailing_mode == "atr":
+                        atr = calc_atr(store)
+                        if atr:
+                            if direction == "LONG":
+                                candidate = round(curr_price - atr * atr_mult, 5)
+                                if candidate > current_sl_price:
+                                    new_sl_price = candidate
+                            else:
+                                candidate = round(curr_price + atr * atr_mult, 5)
+                                if candidate < current_sl_price:
+                                    new_sl_price = candidate
+                    elif trailing_mode == "pct":
                         if direction == "LONG":
-                            candidate = round(curr_candle["close"] - atr * atr_mult, 5)
+                            candidate = round(curr_price * (1 - trailing_pct), 5)
                             if candidate > current_sl_price:
                                 new_sl_price = candidate
                         else:
-                            candidate = round(curr_candle["close"] + atr * atr_mult, 5)
+                            candidate = round(curr_price * (1 + trailing_pct), 5)
+                            if candidate < current_sl_price:
+                                new_sl_price = candidate
+                    else:
+                        # candle mode — low/high de vela anterior (sombra completa)
+                        if direction == "LONG":
+                            candidate = prev_candle["low"]
+                            if candidate > current_sl_price:
+                                new_sl_price = candidate
+                        else:
+                            candidate = prev_candle["high"]
                             if candidate < current_sl_price:
                                 new_sl_price = candidate
 
-                elif trailing_mode == "pct":
-                    curr_price = curr_candle["close"]
+                elif stage == 3:
+                    # Trailing agresivo — body de vela anterior (no shadow)
+                    # LONG: SL = min(open, close) de la vela anterior
+                    # SHORT: SL = max(open, close) de la vela anterior
                     if direction == "LONG":
-                        candidate = round(curr_price * (1 - trailing_pct), 5)
+                        candidate = min(prev_candle["open"], prev_candle["close"])
                         if candidate > current_sl_price:
                             new_sl_price = candidate
                     else:
-                        candidate = round(curr_price * (1 + trailing_pct), 5)
+                        candidate = max(prev_candle["open"], prev_candle["close"])
                         if candidate < current_sl_price:
                             new_sl_price = candidate
 
