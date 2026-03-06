@@ -195,6 +195,19 @@ def calc_ema(values, period):
         out.append(float(v) if i == 0 else float(v) * k + out[-1] * (1 - k))
     return out
 
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1: return None
+    d  = np.diff(closes)
+    ag = np.mean(np.where(d > 0, d, 0.0)[-period:])
+    al = np.mean(np.where(d < 0, -d, 0.0)[-period:])
+    if al == 0: return 100.0
+    return float(100 - 100 / (1 + ag / al))
+
+def avg_body(candles, period=20):
+    """Tamaño promedio del cuerpo de las últimas N velas."""
+    if len(candles) < period: return 0
+    return np.mean([abs(c["close"] - c["open"]) for c in candles[-period:]])
+
 def in_session(epoch: int, session: tuple) -> bool:
     dt   = datetime.fromtimestamp(epoch, tz=timezone.utc)
     h    = dt.hour
@@ -204,14 +217,29 @@ def in_session(epoch: int, session: tuple) -> bool:
 # ─────────────────────────────────────────────
 # ESTRATEGIAS
 # ─────────────────────────────────────────────
-def strat_smc(candles: list, sl_atr_mult: float):
-    """SMC — Fibonacci zones con trigger de confirmacion."""
+def strat_smc(candles: list, sl_atr_mult: float, symbol: str = ""):
+    """
+    SMC mejorado — filtros adicionales por activo:
+    - Rango minimo 2x ATR (antes 1x) — elimina rangos de ruido
+    - Filtro RSI: sobrecompra/venta confirma la zona
+    - Cuerpo trigger > 1.5x promedio — elimina velas debiles
+    - US500: no entrar en primeros 15 min de sesion
+    """
     if len(candles) < 50: return None
-    atr  = calc_atr(candles)
+    atr = calc_atr(candles)
     if not atr: return None
 
-    ultima = candles[-1]
-    previa = candles[-2]
+    ultima  = candles[-1]
+    previa  = candles[-2]
+    closes  = [c["close"] for c in candles]
+    rsi     = calc_rsi(closes)
+    avg_b   = avg_body(candles)
+
+    # Filtro US500 — no entrar en apertura (16:00-16:15 UTC)
+    if symbol == "OTC_SPC":
+        dt = datetime.fromtimestamp(ultima["epoch"], tz=timezone.utc)
+        if dt.hour == 16 and dt.minute < 15:
+            return None
 
     # Detectar fractales
     swing_highs, swing_lows = [], []
@@ -231,53 +259,67 @@ def strat_smc(candles: list, sl_atr_mult: float):
     curr    = ultima["close"]
     rango   = last_sh - last_sl
 
-    if rango < atr or rango <= 0: return None
+    # Rango minimo 2x ATR — elimina rangos de ruido
+    if rango < atr * 2 or rango <= 0: return None
 
-    trigger_bear = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"]
-    trigger_bull = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"]
+    # Trigger con cuerpo fuerte (> 1.5x promedio)
+    trigger_body  = abs(ultima["close"] - ultima["open"])
+    strong_candle = trigger_body > avg_b * 1.5 if avg_b > 0 else True
 
-    # EMA 200 para filtro macro
-    closes  = [c["close"] for c in candles]
+    trigger_bear  = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"] and strong_candle
+    trigger_bull  = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"] and strong_candle
+
+    # EMA 200 filtro macro
     ema200v = calc_ema(closes, 200)
     ema200  = ema200v[-1] if len(ema200v) >= 200 else None
 
-    # SHORT — zona Premium
+    # SHORT — zona Premium + RSI sobrecomprado
     if (ema200 is None or curr < ema200):
         fib_618 = last_sh - (rango * 0.382)
         fib_786 = last_sh - (rango * 0.214)
-        if fib_618 <= curr <= fib_786 and trigger_bear:
-            return {
-                "direction": "SHORT",
-                "entry":     curr,
-                "sl_price":  last_sh + atr * sl_atr_mult,
-            }
+        rsi_ok  = rsi is None or rsi > 60   # RSI confirma sobrecompra
+        if fib_618 <= curr <= fib_786 and trigger_bear and rsi_ok:
+            return {"direction": "SHORT", "entry": curr, "sl_price": last_sh + atr * sl_atr_mult}
 
-    # LONG — zona Discount
+    # LONG — zona Discount + RSI sobrevendido
     if (ema200 is None or curr > ema200):
         fib_618 = last_sl + (rango * 0.382)
         fib_786 = last_sl + (rango * 0.214)
-        if fib_786 <= curr <= fib_618 and trigger_bull:
-            return {
-                "direction": "LONG",
-                "entry":     curr,
-                "sl_price":  last_sl - atr * sl_atr_mult,
-            }
+        rsi_ok  = rsi is None or rsi < 40   # RSI confirma sobreventa
+        if fib_786 <= curr <= fib_618 and trigger_bull and rsi_ok:
+            return {"direction": "LONG", "entry": curr, "sl_price": last_sl - atr * sl_atr_mult}
 
     return None
 
 def strat_ema_cross(candles: list, sl_atr_mult: float):
-    """EMA 9/21 crossover con ATR stop."""
+    """
+    EMA 50/200 crossover (Golden/Death Cross) — mas robusto que 9/21.
+    Filtros adicionales:
+    - RSI > 50 para LONG, RSI < 50 para SHORT (confirma momentum)
+    - Precio debe estar del lado correcto de EMA 200
+    - ATR stop loss
+    """
     closes = [c["close"] for c in candles]
-    if len(closes) < 26: return None
-    e9  = calc_ema(closes, 9)
-    e21 = calc_ema(closes, 21)
-    atr = calc_atr(candles)
-    if not atr: return None
+    if len(closes) < 210: return None
+    e50  = calc_ema(closes, 50)
+    e200 = calc_ema(closes, 200)
+    atr  = calc_atr(candles)
+    rsi  = calc_rsi(closes)
+    if not atr or len(e50) < 2 or len(e200) < 2: return None
     curr = candles[-1]["close"]
-    if e9[-2] <= e21[-2] and e9[-1] > e21[-1]:
+
+    # Golden Cross — EMA50 cruza sobre EMA200
+    if (e50[-2] <= e200[-2] and e50[-1] > e200[-1]
+            and curr > e200[-1]                  # precio sobre EMA200
+            and (rsi is None or rsi > 50)):      # RSI confirma momentum alcista
         return {"direction": "LONG",  "entry": curr, "sl_price": curr - atr * sl_atr_mult}
-    if e9[-2] >= e21[-2] and e9[-1] < e21[-1]:
+
+    # Death Cross — EMA50 cruza bajo EMA200
+    if (e50[-2] >= e200[-2] and e50[-1] < e200[-1]
+            and curr < e200[-1]                  # precio bajo EMA200
+            and (rsi is None or rsi < 50)):      # RSI confirma momentum bajista
         return {"direction": "SHORT", "entry": curr, "sl_price": curr + atr * sl_atr_mult}
+
     return None
 
 # ─────────────────────────────────────────────
@@ -385,7 +427,7 @@ async def backtest_asset(symbol: str, config: dict, months: int) -> dict:
 
         # Correr estrategia
         if config["strategy"] == "smc":
-            signal = strat_smc(window, config["sl_atr_mult"])
+            signal = strat_smc(window, config["sl_atr_mult"], symbol)
         elif config["strategy"] == "ema_cross":
             signal = strat_ema_cross(window, config["sl_atr_mult"])
         else:
