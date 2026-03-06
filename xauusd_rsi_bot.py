@@ -105,7 +105,7 @@ async def keepalive(ws):
     """
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
             await ws.send(json.dumps({"ping": 1}))
         except Exception:
             break  # Si el WS se cerro, la task termina sola
@@ -318,6 +318,9 @@ async def deriv_bot():
     global bot_pausado, trade_abierto, contrato_abierto_id, direction_actual
     global trailing_sl_actual, ultimo_ctx, velas, vela_procesada_epoch
 
+    startup_notificado = False  # mensaje de inicio solo una vez
+    sesion_anterior    = None   # para detectar cambio de sesion
+
     while True:
         try:
             async with websockets.connect(WS_URL) as ws:
@@ -326,7 +329,7 @@ async def deriv_bot():
                 keepalive_task = None  # se lanza despues del auth
 
                 while True:
-                    raw = json.loads(await ws.recv())
+                    raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
 
                     if "error" in raw:
                         err = raw["error"]["message"]
@@ -339,11 +342,15 @@ async def deriv_bot():
                         balance_actual = float(raw["authorize"]["balance"])
                         moneda         = raw["authorize"].get("currency", "USD")
                         print(f"🚀 XAU/USD SMC v9.1 | Saldo: ${balance_actual} {moneda}")
-                        await enviar_telegram(
-                            f"⚡ *XAU/USD Bot SMC v9.1*\n"
-                            f"💰 Saldo: `${balance_actual} {moneda}`\n"
-                            f"⚙️ Keepalive activo | SMC + Sizing Dinamico"
-                        )
+                        if not startup_notificado:
+                            await enviar_telegram(
+                                f"⚡ *XAU/USD Bot SMC v9.1*\n"
+                                f"💰 Saldo: `${balance_actual} {moneda}`\n"
+                                f"⚙️ Keepalive activo | SMC + Sizing Dinamico"
+                            )
+                            startup_notificado = True
+                        else:
+                            print(f"[reconexion] Saldo: ${balance_actual} — sin notificar Telegram")
                         await pedir_velas(ws)
                         await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
                         # Lanzar keepalive
@@ -373,7 +380,21 @@ async def deriv_bot():
                             continue
 
                         sesion = sesion_activa()
-                        if not sesion: continue
+                        if not sesion:
+                            sesion_anterior = None
+                            continue
+
+                        # Notificar al entrar a una sesion nueva
+                        if sesion != sesion_anterior:
+                            sesion_anterior = sesion
+                            emojis = {"asia": "🌏", "londres": "🇬🇧", "ny": "🗽"}
+                            nombres = {"asia": "Asia (00:00-03:00 UTC)", "londres": "Londres (03:00-08:00 UTC)", "ny": "Nueva York (13:00-20:00 UTC)"}
+                            await enviar_telegram(
+                                f"{emojis.get(sesion,'📊')} *Sesion activa: {nombres.get(sesion, sesion)}*\n"
+                                f"💰 Saldo: `${balance_actual} {moneda}`\n"
+                                f"📈 Profit hoy: `${round(profit_dia, 2)}`\n"
+                                f"🤖 XAU/USD SMC v9.1 operando..."
+                            )
 
                         c         = raw["ohlc"]
                         nueva_vela = {
@@ -475,6 +496,11 @@ async def deriv_bot():
                             trailing_sl_actual  = sl
                             print(f"🔒 Trade recuperado: {cid} | SL: ${sl}")
 
+        except asyncio.TimeoutError:
+            if keepalive_task:
+                keepalive_task.cancel()
+            print("⚠️ WS timeout (60s sin datos) — reconectando en 3s...")
+            await asyncio.sleep(3)
         except Exception as e:
             if keepalive_task:
                 keepalive_task.cancel()
