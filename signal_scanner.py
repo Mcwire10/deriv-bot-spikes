@@ -42,7 +42,7 @@ ASSETS = {
         "name": "EUR/USD", "granularity": 900,
         "strategy": "smart_money_mss", "session": "london_open",
         "trailing_mode": "candle", "trailing_after_r": 0.0,
-        "first_signal_only": False, "confidence": 85,
+        "first_signal_only": True, "confidence": 85,
         "use_h1_inertia": True,
     },
     # GBP/JPY — Asia/Londres overlap, confianza 80%
@@ -58,7 +58,7 @@ ASSETS = {
         "name": "US 500", "granularity": 300,
         "strategy": "smart_money_mss", "session": "wallstreet",
         "trailing_mode": "atr", "trailing_atr_mult": 2.0, "trailing_after_r": 0.0,
-        "first_signal_only": False, "confidence": 90,
+        "first_signal_only": True, "confidence": 90,
         "use_h1_inertia": True,
     },
 }
@@ -76,6 +76,7 @@ SESSIONS = {
 candle_store     = defaultdict(list)   # M granularity por activo
 h1_store         = defaultdict(list)   # H1 para inertia filter
 signal_emitted   = defaultdict(lambda: None)
+signal_cooldown  = {}   # { symbol: last_signal_epoch } — evita spam entre velas
 active_contracts: dict = {}
 account_currency = "eUSDT"
 account_balance  = 0.0
@@ -679,6 +680,14 @@ async def process_message(ws, msg):
 
         signal = run_strategy(symbol, config, store)
         if signal:
+            # Anti-spam: no repetir señal por 3 velas (cooldown = granularity * 3)
+            now_epoch = int(datetime.now(timezone.utc).timestamp())
+            cooldown  = config.get("granularity", 900) * 3
+            last      = signal_cooldown.get(symbol, 0)
+            if now_epoch - last < cooldown:
+                continue
+            signal_cooldown[symbol] = now_epoch
+
             if config.get("first_signal_only", False):
                 signal_emitted[symbol] = session_key(symbol)
             await handle_signal(ws, symbol, config, signal)
