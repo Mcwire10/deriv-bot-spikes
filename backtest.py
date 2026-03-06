@@ -259,12 +259,12 @@ def strat_smc(candles: list, sl_atr_mult: float, symbol: str = ""):
     curr    = ultima["close"]
     rango   = last_sh - last_sl
 
-    # Rango minimo 2x ATR — elimina rangos de ruido
-    if rango < atr * 2 or rango <= 0: return None
+    # Rango minimo 1.5x ATR — filtra ruido sin ser demasiado restrictivo
+    if rango < atr * 1.5 or rango <= 0: return None
 
-    # Trigger con cuerpo fuerte (> 1.5x promedio)
+    # Trigger con cuerpo > 1.2x promedio
     trigger_body  = abs(ultima["close"] - ultima["open"])
-    strong_candle = trigger_body > avg_b * 1.5 if avg_b > 0 else True
+    strong_candle = trigger_body > avg_b * 1.2 if avg_b > 0 else True
 
     trigger_bear  = ultima["close"] < ultima["open"] and ultima["close"] < previa["low"] and strong_candle
     trigger_bull  = ultima["close"] > ultima["open"] and ultima["close"] > previa["high"] and strong_candle
@@ -273,19 +273,19 @@ def strat_smc(candles: list, sl_atr_mult: float, symbol: str = ""):
     ema200v = calc_ema(closes, 200)
     ema200  = ema200v[-1] if len(ema200v) >= 200 else None
 
-    # SHORT — zona Premium + RSI sobrecomprado
+    # SHORT — zona Premium + RSI > 55 (sobrecompra moderada)
     if (ema200 is None or curr < ema200):
         fib_618 = last_sh - (rango * 0.382)
         fib_786 = last_sh - (rango * 0.214)
-        rsi_ok  = rsi is None or rsi > 60   # RSI confirma sobrecompra
+        rsi_ok  = rsi is None or rsi > 55
         if fib_618 <= curr <= fib_786 and trigger_bear and rsi_ok:
             return {"direction": "SHORT", "entry": curr, "sl_price": last_sh + atr * sl_atr_mult}
 
-    # LONG — zona Discount + RSI sobrevendido
+    # LONG — zona Discount + RSI < 45 (sobreventa moderada)
     if (ema200 is None or curr > ema200):
         fib_618 = last_sl + (rango * 0.382)
         fib_786 = last_sl + (rango * 0.214)
-        rsi_ok  = rsi is None or rsi < 40   # RSI confirma sobreventa
+        rsi_ok  = rsi is None or rsi < 45
         if fib_786 <= curr <= fib_618 and trigger_bull and rsi_ok:
             return {"direction": "LONG", "entry": curr, "sl_price": last_sl - atr * sl_atr_mult}
 
@@ -308,16 +308,21 @@ def strat_ema_cross(candles: list, sl_atr_mult: float):
     if not atr or len(e50) < 2 or len(e200) < 2: return None
     curr = candles[-1]["close"]
 
-    # Golden Cross — EMA50 cruza sobre EMA200
-    if (e50[-2] <= e200[-2] and e50[-1] > e200[-1]
-            and curr > e200[-1]                  # precio sobre EMA200
-            and (rsi is None or rsi > 50)):      # RSI confirma momentum alcista
+    # EMA 21/50 cross — mas frecuente que 50/200, mas robusto que 9/21
+    # Filtro adicional: precio debe estar del lado correcto de EMA200
+    e21 = calc_ema(closes, 21)
+    if len(e21) < 2: return None
+
+    # Golden Cross EMA21 sobre EMA50 + precio sobre EMA200
+    if (e21[-2] <= e50[-2] and e21[-1] > e50[-1]
+            and curr > e200[-1]
+            and (rsi is None or rsi > 50)):
         return {"direction": "LONG",  "entry": curr, "sl_price": curr - atr * sl_atr_mult}
 
-    # Death Cross — EMA50 cruza bajo EMA200
-    if (e50[-2] >= e200[-2] and e50[-1] < e200[-1]
-            and curr < e200[-1]                  # precio bajo EMA200
-            and (rsi is None or rsi < 50)):      # RSI confirma momentum bajista
+    # Death Cross EMA21 bajo EMA50 + precio bajo EMA200
+    if (e21[-2] >= e50[-2] and e21[-1] < e50[-1]
+            and curr < e200[-1]
+            and (rsi is None or rsi < 50)):
         return {"direction": "SHORT", "entry": curr, "sl_price": curr + atr * sl_atr_mult}
 
     return None
