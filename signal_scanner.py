@@ -109,11 +109,17 @@ async def send_telegram(message: str):
 # KEEPALIVE — evita desconexiones por inactividad
 # ─────────────────────────────────────────────
 async def keepalive(ws):
-    """Ping cada 20s para mantener el WS vivo. Deriv responde con pong."""
+    """
+    Keepalive premium — ping cada 15s + timeout de respuesta.
+    Deriv cierra silenciosamente en fin de semana/fuera de sesión
+    si no hay actividad. 15s es más agresivo que el default de Deriv (30s).
+    """
     while True:
         try:
-            await asyncio.sleep(20)
+            await asyncio.sleep(15)
             await ws.send(json.dumps({"ping": 1}))
+        except asyncio.CancelledError:
+            break
         except Exception:
             break  # WS cerrado — task termina sola
 
@@ -884,7 +890,13 @@ async def main():
     print("  Signal Scanner v8 — Smart Money Edition")
     print("=" * 55)
 
-    async with websockets.connect(DERIV_WS_URL) as ws:
+    async with websockets.connect(
+        DERIV_WS_URL,
+        ping_interval=20,      # WS protocol ping cada 20s (nivel de protocolo)
+        ping_timeout=15,       # Si no responde en 15s → reconectar
+        close_timeout=5,       # Timeout para cerrar limpiamente
+        max_size=2**20,        # 1MB max message size
+    ) as ws:
         await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
         auth = json.loads(await ws.recv())
         if auth.get("error"):
@@ -920,13 +932,13 @@ async def main():
             "──────────────────────────\n"
             f"Balance: *{account_balance} {account_currency}*\n"
             "──────────────────────────\n"
-            "Activos:\n"
-            "🔥 US500 — SMC $2.00 x(50-100)\n"
-            "✅ EUR/USD — SMC $1.00 x(50-100)\n"
-            "✅ GBP/JPY — EMA Cross $1.00 x(50-100)\n"
+            "Activos (RSI Divergencias):\n"
+            "✅ GBP/USD M15 — Londres 08-12h\n"
+            "✅ GBP/JPY M30 — Asia/Londres 06-09h\n"
+            "✅ Silver M15  — NY 13-17h\n"
             "──────────────────────────\n"
-            "Filtros activos: H1 Inertia + Correlation Shield\n"
-            "Trailing: BE@1R → Vela@2R → Agresivo@3R"
+            "Trailing: BE+buffer → ATR trail → Vela → Body\n"
+            "Keepalive: ping 15s | reconexion automatica"
         )
 
         while True:
@@ -949,28 +961,39 @@ async def main():
                 await process_message(ws, msg)
 
             except asyncio.TimeoutError:
-                print("[WS] Timeout 60s sin datos — reconectando en 3s...")
+                print("[WS] Timeout 60s sin datos — reconectando en 5s...")
                 keepalive_task.cancel()
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 break
             except websockets.exceptions.ConnectionClosed as e:
-                print(f"[WS] Conexion cerrada ({e.code}) — reconectando en 3s...")
+                # 1006 = cierre abrupto (Deriv sin actividad de mercado)
+                # 1001 = going away (Cloudflare restart)
+                wait = 10 if e.code == 1006 else 3
+                print(f"[WS] Conexion cerrada ({e.code}) — reconectando en {wait}s...")
                 keepalive_task.cancel()
-                await asyncio.sleep(3)
+                await asyncio.sleep(wait)
                 break
 
 if __name__ == "__main__":
+    import time
+    _fail_count = 0
     while True:
         try:
             asyncio.run(main())
+            _fail_count = 0  # reset si corre bien
         except KeyboardInterrupt:
             print("Scanner detenido.")
             break
         except Exception as e:
+            _fail_count += 1
             err_str = str(e)
-            if "1001" in err_str or "going away" in err_str or "ConnectionClosed" in err_str:
-                print(f"[WS] Cloudflare restart — reconectando en 3s...")
-                import time; time.sleep(3)
+            # Backoff exponencial: 5s, 10s, 20s, 40s... max 120s
+            # En fin de semana Deriv puede estar caido largos ratos
+            wait = min(5 * (2 ** min(_fail_count - 1, 4)), 120)
+            if "1001" in err_str or "going away" in err_str:
+                print(f"[WS] Cloudflare restart — reconectando en {wait}s...")
+            elif "1006" in err_str or "ConnectionClosed" in err_str:
+                print(f"[WS] Conexion perdida — reconectando en {wait}s...")
             else:
-                print(f"[Error critico] {e} — reiniciando en 10s...")
-                import time; time.sleep(10)
+                print(f"[Error critico] {e} — reiniciando en {wait}s...")
+            time.sleep(wait)
