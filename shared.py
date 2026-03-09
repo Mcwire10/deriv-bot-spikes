@@ -24,7 +24,7 @@ FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY", "")   # gratis en finnhub
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-PAPER_MODE         = os.environ.get("PAPER_MODE", "false").lower() == "true"
+PAPER_MODE         = False
 META_DIARIA        = float(os.environ.get("META_DIARIA", "20.0"))
 STOP_LOSS_DIARIO   = float(os.environ.get("STOP_LOSS_DIARIO", "-10.0"))
 DASHBOARD_HORA_UTC = 21   # hora del resumen diario
