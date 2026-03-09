@@ -222,11 +222,18 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
 
             last_epoch = None
             stage = 0
+            ultimo_ctx_stage2_sl = None
 
             async for raw in ws_t:
                 msg = json.loads(raw)
                 if msg.get("msg_type") == "proposal_open_contract":
                     poc = msg.get("proposal_open_contract", {})
+                    
+                    # Evitar intervenir en trades manuales del usuario.
+                    cid_recibido = poc.get("contract_id")
+                    if cid_recibido not in active_contracts:
+                        continue # Es manual, ignorarlo
+
                     if poc.get("status") in ("sold", "expired") or not poc.get("is_valid_to_sell", True):
                         profit = float(poc.get("profit", 0))
                         active_contracts.pop(contract_id, None)
@@ -272,7 +279,24 @@ async def trailing_stop_task(contract_id: int, ctx: dict):
                 elif r_actual >= 2.0:
                     if stage < 2: stage = 2
                     atr = calcular_atr(velas_cerradas)
-                    nuevo_sl_precio = (curr_price - atr * 2.0) if direction == "MULTUP" else (curr_price + atr * 2.0)
+
+                    # Conservador: Combinación Trail Vela a Vela VS ATR
+                    atr_sl_precio = (curr_price - atr * 2.5) if direction == "MULTUP" else (curr_price + atr * 2.5)
+                    candle_sl_precio = velas_cerradas[-2]["low"] if direction == "MULTUP" else velas_cerradas[-2]["high"]
+                    
+                    if direction == "MULTUP":
+                        nuevo_sl_precio = min(atr_sl_precio, candle_sl_precio)
+                        # No permitir que retroceda la protección
+                        if ultimo_ctx_stage2_sl and nuevo_sl_precio < ultimo_ctx_stage2_sl:
+                            nuevo_sl_precio = ultimo_ctx_stage2_sl
+                        else:
+                            ultimo_ctx_stage2_sl = nuevo_sl_precio
+                    else:
+                        nuevo_sl_precio = max(atr_sl_precio, candle_sl_precio)
+                        if ultimo_ctx_stage2_sl and nuevo_sl_precio > ultimo_ctx_stage2_sl:
+                            nuevo_sl_precio = ultimo_ctx_stage2_sl
+                        else:
+                            ultimo_ctx_stage2_sl = nuevo_sl_precio
 
                 if nuevo_sl_precio:
                     dist_pct = abs(curr_price - nuevo_sl_precio) / curr_price

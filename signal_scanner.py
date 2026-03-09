@@ -25,7 +25,7 @@ DERIV_API_TOKEN    = os.environ.get("DERIV_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MAX_OPEN_CONTRACTS = 3
+MAX_OPEN_CONTRACTS = 6
 
 # Correlacion Forex — evita sobreexposicion a la misma moneda
 FOREX_EXPOSURE = {
