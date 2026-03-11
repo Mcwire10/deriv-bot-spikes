@@ -14,6 +14,7 @@ import aiohttp
 import numpy as np
 from datetime import datetime, timezone
 import shared
+from news_analyzer import NewsAnalyzer
 
 # ══════════════════════════════════════════
 #  CONFIGURACIÓN Y CREDENCIALES
@@ -23,7 +24,7 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOL           = "frxXAUUSD"
-STAKE_MINIMO     = 2.00    
+STAKE_MINIMO     = 0.10    
 RIESGO_PCT       = 0.01
 MULTIPLIER_BASE  = 100
 ANTI_SPIKE_MULT  = 3
@@ -36,7 +37,7 @@ SESIONES = {
     "ny":      {"start": 13, "end": 24, "trailing": True,  "tp_ratio": None},
 }
 
-SALDO_MINIMO     = 5.00
+SALDO_MINIMO     = 0.10
 # META_DIARIA y STOP_LOSS_DIARIO vienen de shared.py (env vars)
 
 TZ_UTC = timezone.utc
@@ -57,6 +58,7 @@ velas_m15            = []
 velas_h1             = []
 vela_procesada_epoch = None
 ultimo_cooldown      = 0
+news_analyzer        = NewsAnalyzer()
 
 async def enviar_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -139,6 +141,20 @@ def get_risk_params(velas_arr):
     # Calcular stake basado en el riesgo del balance (1%)
     riesgo_usd = balance_actual * RIESGO_PCT if balance_actual else STAKE_MINIMO
     return riesgo_usd, multiplier
+
+async def check_news_sentiment(direction: str) -> bool:
+    """
+    Checks the current LLM-based sentiment bias.
+    """
+    bias = await news_analyzer.get_gold_bias()
+    if bias == "BULLISH" and direction == "MULTDOWN":
+        print(f"[news-ia] Short bloqueado — Sentimiento BULLISH")
+        return False
+    if bias == "BEARISH" and direction == "MULTUP":
+        print(f"[news-ia] Long bloqueado — Sentimiento BEARISH")
+        return False
+    print(f"[news-ia] Sentimiento {bias} — Dirección {direction} permitida")
+    return True
 
 # ══════════════════════════════════════════
 #  ESTRATEGIA SMC
@@ -539,7 +555,22 @@ async def deriv_bot():
                                     )
                                 else:
                                     # Llama al websocket asincrono para abrir
-                                    asyncio.create_task(open_trade(ws, señal, sesion))
+                                    # --- INTEGRACION ESTRATEGIA 7 (NOTICIAS IA) ---
+                                    if await check_news_sentiment(señal["dir"]):
+                                        asyncio.create_task(open_trade(ws, señal, sesion))
+                                    else:
+                                        print(f"[strategy-7] Señal {señal['dir']} descartada por IA")
+
+                    # ── PROTECCION MANUAL TRADES (REPORTE) ──
+                    if "proposal_open_contract" in raw:
+                        poc = raw["proposal_open_contract"]
+                        cid = poc.get("contract_id")
+                        if cid and cid not in active_contracts and cid not in contratos_vistos:
+                             # Es un trade que NO abrio este bot (manual o de otro bot)
+                             # No lo tocamos, solo reportamos en consola una vez
+                             if poc.get("status") == "open":
+                                 print(f"🛡️ [manual-trade] Protegiendo contrato externo: {cid} ({poc.get('display_name')})")
+                                 contratos_vistos.add(cid)
 
         except asyncio.TimeoutError:
             if keepalive_task: keepalive_task.cancel()
