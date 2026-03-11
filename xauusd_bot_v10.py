@@ -31,9 +31,9 @@ GRANULARITY      = 900
 CANDLES_COUNT    = 250
 
 SESIONES = {
-    "asia":    {"start": 0,  "end": 3,  "trailing": False, "tp_ratio": 1.0},
-    "londres": {"start": 3,  "end": 8,  "trailing": True,  "tp_ratio": None},
-    "ny":      {"start": 13, "end": 20, "trailing": True,  "tp_ratio": None},
+    "asia":    {"start": 0,  "end": 4,  "trailing": False, "tp_ratio": 1.0},
+    "londres": {"start": 4,  "end": 13, "trailing": True,  "tp_ratio": None},
+    "ny":      {"start": 13, "end": 24, "trailing": True,  "tp_ratio": None},
 }
 
 SALDO_MINIMO     = 5.00
@@ -113,8 +113,8 @@ def es_vela_normal(vela, velas_arr):
 #  FILTROS DE RIESGO E INERCIA
 # ══════════════════════════════════════════
 def check_h1_inertia(direction: str) -> bool:
-    if len(velas_h1) < 200:
-        return True # sin datos suficientes
+    return True # Bypass temporal para operar en Fast Markets
+    
     
     closes_h1 = [v["close"] for v in velas_h1]
     ema_200_h1 = calcular_ema(closes_h1, 200)

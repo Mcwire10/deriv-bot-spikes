@@ -43,19 +43,19 @@ ASSETS = {
     # GBP/USD — Divergencia RSI, confianza 85%
     "frxGBPUSD": {
         "name": "GBP/USD", "granularity": 900,
-        "strategy": "rsi_divergence", "session": "london_newyork_overlap",
+        "strategy": "rsi_divergence", "session": "all",
         "trailing_mode": "optimized", "trailing_after_r": 0.0,
         "first_signal_only": False, "confidence": 85,
-        "use_h1_inertia": True,
+        "use_h1_inertia": False,
         "trailing_atr_mult": 1.5,
     },
     # GBP/JPY — Divergencia RSI, confianza 80%
     "frxGBPJPY": {
         "name": "GBP/JPY", "granularity": 1800,
-        "strategy": "rsi_divergence", "session": "asia_london_overlap",
+        "strategy": "rsi_divergence", "session": "all",
         "trailing_mode": "optimized", "trailing_after_r": 0.0,
         "first_signal_only": False, "confidence": 80,
-        "use_h1_inertia": True,
+        "use_h1_inertia": False,
         "trailing_atr_mult": 2.5,
     },
     # Silver XAG/USD — Divergencia RSI, confianza 85%
@@ -64,7 +64,7 @@ ASSETS = {
         "strategy": "rsi_divergence", "session": "all",
         "trailing_mode": "optimized", "trailing_after_r": 0.0,
         "first_signal_only": False, "confidence": 85,
-        "use_h1_inertia": True,
+        "use_h1_inertia": False,
         "trailing_atr_mult": 2.0,
     },
 }
